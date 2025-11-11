@@ -33,7 +33,7 @@ git lfs install
 git lfs pull
 # uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
-# pick one: cpu / cu118 / cu126 / cu128
+# gpu required... pick one: cu126/ cu128 / cu130
 uv sync --group cu126
 # activate or use "uv run python ..."
 source .venv/bin/activate
