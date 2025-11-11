@@ -151,9 +151,10 @@ if __name__ == "__main__":
   from pathlib import Path
   batch_size = 8
   device = torch.device('cuda', 0)
-  files = ['b0c9d2329ad1606b|2018-07-29--12-02-42/31/video.hevc']
-  data_dir = Path('/raid.unprotected/datasets/comma2k19_compression/Chunk_1/')
-  ds = DaliHevcDataset(files, data_dir=data_dir, batch_size=batch_size, device_id=device.index)
+  files = ['b0c9d2329ad1606b|2018-07-29--11-17-20/7/video.hevc']
+  uncompressed_archive_path = Path('./test_videos.zip')
+  uncompressed_data_dir = Path('./deflated_test_videos/')
+  ds = DaliHevcDataset(files, archive_path=uncompressed_archive_path, data_dir=uncompressed_data_dir, batch_size=batch_size, device_id=device.index)
   segnet = SegNet().eval().to(device)
   segnet_sd = load_file(segnet_sd_path, device=str(device))
   segnet.load_state_dict(segnet_sd)

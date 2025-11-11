@@ -37,6 +37,12 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync --group cu126
 # activate or use "uv run python ..."
 source .venv/bin/activate
+# download videos
+curl -fLO https://huggingface.co/datasets/commaai/comma2k19/resolve/main/compression_challenge/test_videos.zip
+# test dataloaders
+python frame_utils_dali.py
+# test models
+python modules.py
 ```
 
 ## submission format
