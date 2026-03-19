@@ -17,6 +17,7 @@ def main():
   parser.add_argument("--seed", type=int, default=1234, help="RNG seed")
   parser.add_argument("--device", type=str, default=None, help="device: 'cpu' or 'cuda' (default: auto-detect)")
   parser.add_argument("--dataloader", type=Path, required=True, help="path to a .py file exporting DatasetClass")
+  parser.add_argument("--report", type=Path, default=Path("report.txt"), help="output report file path")
   args = parser.parse_args()
 
   if args.device is not None:
@@ -105,7 +106,7 @@ def main():
         f"  Final score: 100*segnet_dist + √(10*posenet_dist) + 25*rate = {score:.8f}"
       ]
       print("\n".join(printed_results))
-      with open("report.txt", "w") as f:
+      with open(args.report, "w") as f:
         f.write("\n".join(printed_args + printed_results) + "\n")
 
   # Cleanup

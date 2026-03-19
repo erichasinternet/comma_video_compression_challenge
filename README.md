@@ -47,7 +47,7 @@ python frame_utils.py
 python modules.py
 
 # naively recompress
-bash examples/compress.sh --crf 30 --scale 1 --in-dir test_videos/ --jobs 1 --video-names-file public_test_video_names.txt
+bash examples/compress.sh --crf 30 --scale 1 --in-dir test_videos/ --jobs 1 --video-names-file public_test_video_names.txt --out-dir my_output/ --encoder gpu
 
 # evaluate the naive recompression strategy
 torchrun --nproc-per-node 1 evaluate.py  --dataloader examples/dataloader.py # or just python evaluate.py --dataloader examples/dataloader.py
