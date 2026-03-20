@@ -46,11 +46,16 @@ python frame_utils.py
 # test models
 python modules.py
 
-# naively recompress
-bash examples/baseline_fast.sh --in-dir test_videos/ --jobs 1 --video-names-file public_test_video_names.txt --out-dir ./submission/
+# create a submission dir and copy the fast baseline scripts
+mkdir -p submissions/my_submission
+cp submissions/baseline_fast/compress.sh submissions/my_submission/
+cp submissions/baseline_fast/inflate.sh submissions/my_submission/
 
-# evaluate the naive recompression strategy
-torchrun --nproc-per-node 1 evaluate.py  --dataloader examples/baseline_dataloader_fast.py --compressed-dir ./submission
+# naively recompress (creates submissions/my_submission/archive.zip)
+bash submissions/my_submission/compress.sh
+
+# evaluate the submission
+bash evaluate.sh --submission-dir ./submissions/my_submission --device cuda
 ```
 
 If everything worked as expected, this should producce a `report.txt` file with this content:
@@ -58,63 +63,58 @@ If everything worked as expected, this should producce a `report.txt` file with 
 ```
 === Evaluation config ===
   batch_size: 16
-  compressed_dir: submission
-  dataloader: examples/baseline_dataloader_fast.py
-  device: None
+  device: cuda
   num_threads: 2
   prefetch_queue_depth: 4
-  report: report.txt
+  report: submissions/my_submission/report.txt
   seed: 1234
-  uncompressed_dir: test_videos
+  submission_dir: submissions/my_submission
+  uncompressed_dir: /home/batman/comma2k25_compression_challenge/test_videos
+  video_names_file: /home/batman/comma2k25_compression_challenge/public_test_video_names.txt
 === Evaluation results over 600 samples ===
-  Average PoseNet Distortion: 0.06430182
-  Average SegNet Distortion: 0.00381109
-  Submission file size (deflated): 14428760.00000000 bytes
-  Original uncompressed size (deflated): 37533786.00000000 bytes
-  Compression Rate (deflated): 0.38442059
-  Final score: 100*segnet_dist + √(10*posenet_dist) + 25*rate = 10.79350826
+  Average PoseNet Distortion: 0.06424776
+  Average SegNet Distortion: 0.00381220
+  Submission file size: 11580703 bytes
+  Original uncompressed size: 37533786 bytes
+  Compression Rate: 0.30854076
+  Final score: 100*segnet_dist + √(10*posenet_dist) + 25*rate = 8.89628579
 ```
 
 ## submission format and rules
 
-`DatasetClass` should be a subclass of `torch.utils.data.IterableDataset` defined in a python file, with the following signature and methods.
+A submission is a directory containing two files:
 
-The dataset should yield batches of decompressed video frames of `file_names` as torch tensors, which will be fed to the distortion evaluation models.
+- **`archive.zip`** — your compressed data. Its size is used to compute the rate term of the score. It will be unzipped into `archive/` by the evaluation script.
+- **`inflate.sh`** — a bash script that converts the extracted `archive/` contents into raw video frames.
 
-The dataset can consume anything in `args.compressed_dir` to produce the batches, all files in `args.compressed_dir` will be used to compute the compressed size for the rate term of the score.
+`inflate.sh` is called with three positional arguments:
 
-External libraries and tools can be used and won't be counted towards the compressed size, unless they use large artifacts (such as neural networks, meshes, point clouds, etc.).
-
-The dataset should not consume anything outside of `args.compressed_dir`.
-
-You can use anything for compression, including the models and the original uncompressed videos. Include your compression code if you wish but it won't be used for evaluation.
-
-```python
-
-class DatasetClass(torch.utils.data.IterableDataset):
-  def __init__(
-      self,
-      file_names: List[str],
-      batch_size: int,
-      device: torch.device,
-      ...
-      ):
-
-  def prepare_data(self):
-    # called by all ranks
-    # e.g. do something with if needed submission.zip
-    ...
-
-  def __iter__(self):
-    for file_name in self.file_names:
-      # yield name, idx, batch
-
-      # name: segment_id
-      # idx: batch index within the segment
-      # batch: torch.Tensor with shape (batch_size, seq_len, camera_size[1], camera_size[0], 3), dtype=uint8
-      ...
-
+```bash
+bash inflate.sh <archive_dir> <output_dir> <video_names_file>
 ```
+
+- `archive_dir`: path where `archive.zip` has been extracted
+- `output_dir`: path where inflated frames must be written
+- `video_names_file`: text file listing video paths, one per line
+
+For each line in `video_names_file`, `inflate.sh` must produce a raw video file at `<output_dir>/<segment_id>/video.raw`.
+
+See [submissions/baseline/](submissions/baseline/) for a working example.
+
+### evaluation
+
+```bash
+bash evaluate.sh --submission-dir ./submissions/baseline --device cpu
+```
+
+Use `--device cuda` for faster local evaluation. Official evaluation in CI uses `--device cpu`.
+
+### rules
+
+- External libraries and tools can be used and won't count towards compressed size, unless they use large artifacts (neural networks, meshes, point clouds, etc.).
+- You can use anything for compression, including the models and the original uncompressed videos.
+- You may include your compression script in the submission, but it's not required.
+- `inflate.sh` should not consume anything outside of the submission directory and the extracted archive.
 
 ## going further
 
