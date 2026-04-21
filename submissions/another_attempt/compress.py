@@ -31,6 +31,7 @@ from enum import Enum
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 # Performance optimizations for high-end GPUs (e.g. RTX 3090, 4090, 5090)
 torch.backends.cudnn.benchmark = True
@@ -548,8 +549,8 @@ class JointFrameGenerator(nn.Module):
 
     def forward(self, mask2, pose6):
         coords      = make_coord_grid(mask2.shape[0], 384, 512, mask2.device, torch.float32)
-        shared_feat = self.shared_trunk(mask2, coords)
-        return self.frame1_head(shared_feat, self.pose_mlp(pose6)), self.frame2_head(shared_feat)
+        shared_feat = checkpoint.checkpoint(self.shared_trunk, mask2, coords, use_reentrant=False)
+        return self.frame1_head(shared_feat, self.pose_mlp(pose6)), checkpoint.checkpoint(self.frame2_head, shared_feat, use_reentrant=False)
 
 # ─── Training ─────────────────────────────────────────────────────────────────
 def apply_freeze_state(model, stage):
