@@ -2,13 +2,15 @@
 """
 another_attempt/compress.py
 
-Improvements over quantizr:
-  1. Lossless AV1 for mask video: 5-class content (only 5 distinct pixel values)
-     compresses more efficiently losslessly than at CRF=50. No quantization noise
-     means exact class values, eliminating the train/inference mask mismatch.
-  2. Wider generator: c1=64, c2=80 (vs c1=56, c2=64) — better quality at low extra cost.
-  3. SegNet loss for frame1 added to FINETUNE stage (quantizr drops it in run5).
-  4. Cleaner training schedule: larger QAT phase, better error boost ramp.
+Improvements over quantizr (rate-dominant strategy):
+  1. Temporal mask stride K_TEMPORAL: store one mask every K pairs (default K=2).
+     Generator receives a within-window pair_idx (FiLM-conditioned) and learns
+     to hallucinate the per-pair drift from a single keyframe mask.
+  2. Spatial mask downsample: store at MASK_H x MASK_W (192x256) instead of
+     384x512. Network upsamples embeddings internally.
+  3. Lossless AV1 for the kept mask sequence.
+  4. Pose stored as per-dim min/max (12 fp32) + uint16 quantized values, brotli'd.
+  5. Both heads (frame1, frame2) FiLM-conditioned on (pose + pair_idx_emb).
 """
 import os
 import sys
@@ -22,10 +24,8 @@ import numpy as np
 import logging
 import warnings
 import brotli
-import io
-import tempfile
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 import torch
@@ -33,7 +33,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-# Performance optimizations for high-end GPUs (e.g. RTX 3090, 4090, 5090)
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.fp32_precision = 'tf32'
 torch.backends.cudnn.conv.fp32_precision = 'tf32'
@@ -46,11 +45,18 @@ from safetensors.torch import load_file
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from frame_utils import AVVideoDataset, DaliVideoDataset, segnet_model_input_size
+from frame_utils import segnet_model_input_size  # noqa
 from modules import SegNet, PoseNet, DistortionNet, segnet_sd_path, posenet_sd_path
 
+# ─── Format constants (must match inflate.py) ────────────────────────────────
 SEQ_LEN = 2
-SEGNET_MODEL_INPUT_SIZE = (512, 384)  # (W, H) — masks stored at this resolution
+NET_W, NET_H = 512, 384
+OUT_W, OUT_H = 1164, 874
+N_PAIRS_PER_FILE = 600
+COND_DIM = 48
+POSE_DIM = 6
+MASK_CRF = 63   # max AV1 quantization; mask is lossy but generator is trained on the noisy roundtrip
+
 
 class Stage(Enum):
     ANCHOR  = "anchor"
@@ -71,7 +77,8 @@ class PipelineRun:
     warmup_epochs: int = 2
     ema_decay: float = 0.99
     grad_clip: float = 1.0
-    frame1_seg_weight: float = 0.0  # explicit frame1 segnet weight (new vs quantizr)
+    frame1_seg_weight: float = 0.0
+
 
 def get_ffmpeg_path():
     local = ROOT_DIR / "ffmpeg"
@@ -85,31 +92,30 @@ def get_ffmpeg_path():
 def diff_round(x):
     return x + (x.round() - x).detach()
 
-# ─── EMA ────────────────────────────────────────────────────────────────────
+
+# ─── EMA ──────────────────────────────────────────────────────────────────────
 class EMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
         self.backup = {}
-
     def update(self, model):
         for n, p in model.named_parameters():
             if p.requires_grad:
                 self.shadow[n] = (1 - self.decay) * p.data + self.decay * self.shadow[n]
-
     def apply_shadow(self, model):
         for n, p in model.named_parameters():
             if p.requires_grad:
                 self.backup[n] = p.data
                 p.data = self.shadow[n]
-
     def restore(self, model):
         for n, p in model.named_parameters():
             if p.requires_grad:
                 p.data = self.backup[n]
         self.backup = {}
 
-# ─── YUV helpers ────────────────────────────────────────────────────────────
+
+# ─── YUV helpers (for posenet on fake frames) ────────────────────────────────
 def diff_rgb_to_yuv6(rgb_chw):
     h, w = rgb_chw.shape[-2:]
     h2, w2 = h // 2, w // 2
@@ -148,7 +154,8 @@ def assert_finite(name, x):
     if not torch.isfinite(x).all():
         raise RuntimeError(f"non-finite in {name}: shape={tuple(x.shape)}")
 
-# ─── Video preloading ────────────────────────────────────────────────────────
+
+# ─── Video preloading via DALI ───────────────────────────────────────────────
 def hevc_frame_count(path):
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as b:
         frames, i = 0, 0
@@ -165,6 +172,28 @@ def container_frame_count(path):
     n = s.frames or sum(1 for pkt in c.demux(s) if pkt.size > 0)
     c.close()
     return n
+
+def preload_video_pair_cache_av(file_names, data_dir):
+    """PyAV CPU fallback (NVDEC isn't available on every card, e.g. CMP 170HX)."""
+    logging.info("Preloading RGB pairs via PyAV (CPU decode)...")
+    from frame_utils import yuv420_to_rgb
+    all_pairs = []
+    for fnm in file_names:
+        path = str(data_dir / fnm)
+        fmt = "hevc" if path.endswith(".hevc") else None
+        container = av.open(path, format=fmt)
+        stream = container.streams.video[0]
+        seq_buf = []
+        for frame in tqdm(container.decode(stream), desc=f"Decode {fnm}"):
+            seq_buf.append(yuv420_to_rgb(frame))
+            if len(seq_buf) == SEQ_LEN:
+                all_pairs.append(torch.stack(seq_buf))
+                seq_buf = []
+        container.close()
+    if not all_pairs:
+        raise RuntimeError("No video data loaded.")
+    return torch.stack(all_pairs).contiguous()
+
 
 def preload_video_pair_cache_dali(file_names, data_dir, batch_size, device, num_threads=4, prefetch_queue_depth=4):
     logging.info("Preloading RGB pairs via DALI...")
@@ -205,93 +234,91 @@ def preload_video_pair_cache_dali(file_names, data_dir, batch_size, device, num_
         raise RuntimeError("No video data loaded.")
     return torch.cat(all_batches, dim=0).contiguous()
 
-# ─── Mask extraction & compression ──────────────────────────────────────────
+
+# ─── Mask extraction & compression ───────────────────────────────────────────
 def extract_and_compress_masks(rgb_pairs_all, segnet, device, archive_dir, batch_size=8):
     """
-    Extract segmentation masks for odd frames (frame2 of each pair),
-    compress them with LOSSLESS AV1.
+    Compute segmentation masks at NET_H×NET_W, encode with lossy AV1 (CRF=MASK_CRF).
+    Decode the roundtrip so training sees exactly the noisy mask inflate will see.
 
-    Lossless is better than CRF=50 for 5-class content because:
-      - Only 5 distinct pixel values {0, 63, 126, 189, 252}
-      - Exact values compress better (residual=0 for unchanged blocks)
-      - No quantization noise → no train/inference mismatch
+    Returns:
+      noisy_masks: [N_PAIRS, NET_H, NET_W] uint8  - post-roundtrip mask, fed to generator
+      gt_masks:    [N_PAIRS, NET_H, NET_W] uint8  - clean segnet output, used as GT for loss
     """
-    expected = rgb_pairs_all.shape[0]
-    raw_path  = archive_dir / "raw_masks.yuv"
-    obu_path  = archive_dir / "mask.obu"
-    obu_br    = archive_dir / "mask.obu.br"
+    n_pairs = rgb_pairs_all.shape[0]
+    raw_path = archive_dir / "raw_masks.yuv"
+    obu_path = archive_dir / "mask.obu"
+    obu_br   = archive_dir / "mask.obu.br"
 
-    if obu_br.exists():
-        logging.info("Cached mask found. Verifying...")
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".obu", delete=False) as tmp:
-                tmp.write(brotli.decompress(open(obu_br, "rb").read()))
-                tmp_path = tmp.name
-            c = av.open(tmp_path)
-            frames = []
-            for frame in c.decode(video=0):
-                img = frame.to_ndarray(format="gray")
-                frames.append(np.clip(np.round(img / 63.0).astype(np.uint8), 0, 4))
-            c.close()
-            os.remove(tmp_path)
-            if len(frames) == expected:
-                logging.info(f"Mask cache valid ({len(frames)} frames).")
-                return torch.from_numpy(np.stack(frames)).contiguous()
-            logging.warning(f"Mask cache incomplete ({len(frames)}/{expected}). Regenerating...")
-        except Exception as e:
-            logging.warning(f"Mask cache load failed ({e}). Regenerating...")
+    logging.info(f"Generating segnet GT masks (clean) for {n_pairs} pairs...")
+    gt_masks = torch.empty((n_pairs, NET_H, NET_W), dtype=torch.uint8)
+    with torch.inference_mode():
+        for start in tqdm(range(0, n_pairs, batch_size), desc="Masks"):
+            end = min(start + batch_size, n_pairs)
+            batch = rgb_pairs_all[start:end].to(device).float()
+            batch = einops.rearrange(batch, "b t h w c -> b t c h w")
+            frame2 = batch[:, 1]
+            resized = F.interpolate(frame2, size=(NET_H, NET_W), mode="bilinear")
+            mask_full = segnet(resized).argmax(dim=1).to(torch.uint8)
+            gt_masks[start:end] = mask_full.cpu()
 
-    logging.info("Generating masks from RGB pairs...")
-    W, H = SEGNET_MODEL_INPUT_SIZE
     with open(raw_path, "wb") as f_out:
-        with torch.inference_mode():
-            for start in tqdm(range(0, expected, batch_size), desc="Masks"):
-                batch = rgb_pairs_all[start:start+batch_size].to(device).float()
-                batch = einops.rearrange(batch, "b t h w c -> b t c h w")
-                frames = batch[:, 1]  # odd frame (frame2)
-                resized = F.interpolate(frames, size=(H, W), mode="bilinear")
-                mask = segnet(resized).argmax(dim=1).to(torch.uint8)
-                f_out.write((mask * 63).cpu().numpy().tobytes())
+        f_out.write((gt_masks * 63).numpy().tobytes())
 
-    logging.info("Compressing masks with lossless AV1...")
+    logging.info(f"Compressing masks with AV1 CRF={MASK_CRF} (lossy, mask quantization noise)...")
     cmd = [
         get_ffmpeg_path(), "-y", "-hide_banner",
         "-f", "rawvideo", "-pix_fmt", "gray",
-        "-s", f"{W}x{H}", "-r", "10",
+        "-s", f"{NET_W}x{NET_H}", "-r", "10",
         "-i", str(raw_path),
         "-c:v", "libaom-av1",
-        "-crf", "0", "-b:v", "0",
-        "-cpu-used", "4",
+        "-crf", str(MASK_CRF),
+        "-cpu-used", "0",
         "-row-mt", "1",
-        "-g", "600",
-        "-keyint_min", "600",
+        "-g", "1200",
+        "-keyint_min", "1200",
         "-lag-in-frames", "48",
-        "-aom-params", "lossless=1:enable-cdef=0:enable-intrabc=1:enable-obmc=0:enable-palette=1",
+        "-arnr-strength", "0",
+        "-aq-mode", "0",
+        "-aom-params", "enable-cdef=0:enable-intrabc=1:enable-obmc=0",
         "-f", "obu",
         str(obu_path),
     ]
     subprocess.run(cmd, check=True)
 
-    logging.info("Brotli compressing OBU...")
     with open(obu_path, "rb") as fi, open(obu_br, "wb") as fo:
         fo.write(brotli.compress(fi.read(), quality=11, lgwin=24))
+    logging.info(f"  mask.obu.br: {obu_br.stat().st_size:,} bytes")
 
-    c = av.open(str(obu_path))
-    frames = []
-    for frame in c.decode(video=0):
-        img = frame.to_ndarray(format="gray")
-        frames.append(np.clip(np.round(img / 63.0).astype(np.uint8), 0, 4))
-    c.close()
-
-    if len(frames) != expected:
-        raise RuntimeError(f"Mask encode failed: got {len(frames)}, expected {expected}.")
-
+    # Decode roundtrip → these are the masks the generator must learn from at inference.
+    container = av.open(str(obu_path))
+    decoded = []
+    for fr in container.decode(video=0):
+        img = fr.to_ndarray(format="gray")
+        decoded.append(np.clip(np.round(img / 63.0), 0, 4).astype(np.uint8))
+    container.close()
     obu_path.unlink()
     raw_path.unlink()
-    return torch.from_numpy(np.stack(frames)).contiguous()
+
+    if len(decoded) != n_pairs:
+        raise RuntimeError(f"Mask roundtrip produced {len(decoded)} frames, expected {n_pairs}.")
+    noisy_masks = torch.from_numpy(np.stack(decoded)).contiguous()
+    err_pct = (noisy_masks != gt_masks).float().mean().item() * 100
+    logging.info(f"  Mask class disagreement (noisy vs clean): {err_pct:.3f}%")
+    return noisy_masks, gt_masks
+
+
+def encode_pose_bin(pose_arr: np.ndarray) -> bytes:
+    """[N, 6] fp32 → bytes: 12 fp32 (mn||mx) + N*6 uint16."""
+    mn = pose_arr.min(axis=0).astype(np.float32)
+    mx = pose_arr.max(axis=0).astype(np.float32)
+    rng = np.maximum(mx - mn, 1e-9)
+    norm = np.round((pose_arr - mn[None, :]) / rng[None, :] * 65535.0).clip(0, 65535).astype(np.uint16)
+    return mn.tobytes() + mx.tobytes() + norm.tobytes()
+
 
 def extract_and_compress_poses(rgb_pairs_all, posenet, device, archive_dir, batch_size=8):
-    br_path = archive_dir / "pose.npy.br"
+    br_path = archive_dir / "pose.bin.br"
     all_pose6 = []
     logging.info("Extracting poses...")
     with torch.inference_mode():
@@ -301,24 +328,40 @@ def extract_and_compress_poses(rgb_pairs_all, posenet, device, archive_dir, batc
             out   = posenet(posenet.preprocess_input(batch))
             all_pose6.append(get_pose_tensor(out)[..., :6].float().cpu().numpy())
 
-    pose_arr = np.concatenate(all_pose6, axis=0)
-    buf = io.BytesIO()
-    np.save(buf, pose_arr)
-    buf.seek(0)
+    pose_arr = np.concatenate(all_pose6, axis=0).astype(np.float32)  # [N, 6]
+    payload = encode_pose_bin(pose_arr)
     with open(br_path, "wb") as f:
-        f.write(brotli.compress(buf.read(), quality=11, lgwin=24))
-    return torch.from_numpy(pose_arr).float().contiguous()
+        f.write(brotli.compress(payload, quality=11, lgwin=24))
 
-# ─── Data loader ─────────────────────────────────────────────────────────────
+    # Reconstruct what inflate.py will see (i16 → fp32 round-trip)
+    mn = pose_arr.min(axis=0); mx = pose_arr.max(axis=0)
+    rng = np.maximum(mx - mn, 1e-9)
+    norm = np.round((pose_arr - mn[None, :]) / rng[None, :] * 65535.0).clip(0, 65535)
+    reconstructed = mn[None, :] + norm / 65535.0 * rng[None, :]
+
+    logging.info(f"  pose.bin.br: {br_path.stat().st_size:,} bytes "
+                 f"(round-trip max abs err: {np.max(np.abs(pose_arr - reconstructed)):.2e})")
+    return torch.from_numpy(reconstructed.astype(np.float32)).contiguous()
+
+
+# ─── Data loader ──────────────────────────────────────────────────────────────
 class CachedPairLoader:
-    def __init__(self, rgb_pairs, mask2, pose6, batch_size, device, seed=123, shuffle=True):
-        self.rgb_pairs  = rgb_pairs.contiguous()
-        self.mask2      = mask2.contiguous()
-        self.pose6      = pose6.contiguous()
+    """
+    Yields (rgb_pair, noisy_mask, gt_mask, pose6) per pair.
+    `noisy_mask` is the post-AV1-roundtrip mask (matches what inflate.py decodes);
+    `gt_mask` is the clean segnet output, used as the cross-entropy/KL target.
+    """
+    def __init__(self, rgb_pairs, noisy_masks, gt_masks, pose6,
+                 batch_size, device, seed=123, shuffle=True):
+        self.rgb_pairs   = rgb_pairs.contiguous()
+        self.noisy_masks = noisy_masks.contiguous()
+        self.gt_masks    = gt_masks.contiguous()
+        self.pose6       = pose6.contiguous()
         self.batch_size = batch_size
-        self.device     = device
+        self.device = device
         self.seed, self.shuffle = seed, shuffle
-        self.epoch, self.num_samples = 0, rgb_pairs.shape[0]
+        self.epoch = 0
+        self.num_samples = rgb_pairs.shape[0]
 
     def set_epoch(self, e): self.epoch = int(e)
     def __len__(self): return math.ceil(self.num_samples / self.batch_size)
@@ -331,11 +374,13 @@ class CachedPairLoader:
             idx = perm[start:start+self.batch_size]
             yield (
                 self.rgb_pairs.index_select(0, idx).to(self.device, non_blocking=True),
-                self.mask2.index_select(0, idx).to(self.device, non_blocking=True),
+                self.noisy_masks.index_select(0, idx).to(self.device, non_blocking=True),
+                self.gt_masks.index_select(0, idx).to(self.device, non_blocking=True),
                 self.pose6.index_select(0, idx).to(self.device, non_blocking=True),
             )
 
-# ─── FP4 quantization ────────────────────────────────────────────────────────
+
+# ─── FP4 quantization ─────────────────────────────────────────────────────────
 class FP4Codebook:
     pos_levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
@@ -427,6 +472,7 @@ def export_fp4_state_dict(model, out_path, block_size=32):
             export["dense_fp16"][k] = v.detach().cpu().half() if torch.is_floating_point(v) else v.detach().cpu()
     torch.save(export, out_path, _use_new_zipfile_serialization=False)
 
+
 # ─── Quantizable modules ──────────────────────────────────────────────────────
 class QMixin:
     def set_qat(self, enabled, act_enabled=False):
@@ -437,7 +483,6 @@ class QConv2d(nn.Conv2d, QMixin):
     def __init__(self, *args, block_size=32, quantize_weight=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.block_size, self.quantize_weight, self.qat_enabled = block_size, quantize_weight, False
-
     def forward(self, x):
         w = fake_quant_fp4_ste(self.weight, self.block_size) if self.qat_enabled and self.quantize_weight else self.weight
         return F.conv2d(x, w, self.bias, self.stride, self.padding, self.dilation, self.groups)
@@ -446,12 +491,12 @@ class QEmbedding(nn.Embedding, QMixin):
     def __init__(self, *args, block_size=32, quantize_weight=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.block_size, self.quantize_weight, self.qat_enabled = block_size, quantize_weight, False
-
     def forward(self, x):
         w = fake_quant_fp4_ste(self.weight, self.block_size) if self.qat_enabled and self.quantize_weight else self.weight
         return F.embedding(x, w, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse)
 
-# ─── Architecture — wider channels (c1=64, c2=80) ────────────────────────────
+
+# ─── Architecture ─────────────────────────────────────────────────────────────
 class SepConvGNAct(nn.Module):
     def __init__(self, in_ch, out_ch, k=3, stride=1, depth_mult=4, quantize_weight=True):
         super().__init__()
@@ -493,7 +538,7 @@ class FiLMSepResBlock(nn.Module):
         return self.act(x + xb * (1.0 + gamma) + beta)
 
 class SharedMaskDecoder(nn.Module):
-    """Wider than quantizr: c1=64, c2=80 (was c1=56, c2=64)."""
+    """Mask is fed at MASK_H×MASK_W; embeddings are bilinearly upsampled to NET_H×NET_W."""
     def __init__(self, num_classes=5, emb_dim=6, c1=64, c2=80, depth_mult=1):
         super().__init__()
         self.embedding  = QEmbedding(num_classes, emb_dim, quantize_weight=False)
@@ -515,6 +560,16 @@ class SharedMaskDecoder(nn.Module):
         z      = self.up(self.down_block(self.down_conv(s)))
         return self.fuse_block(self.fuse(torch.cat([z, s], dim=1)))
 
+class FrameHead(nn.Module):
+    def __init__(self, in_ch, cond_dim=COND_DIM, hidden=64, depth_mult=1):
+        super().__init__()
+        self.block1 = FiLMSepResBlock(in_ch, cond_dim, depth_mult=depth_mult)
+        self.block2 = SepResBlock(in_ch, depth_mult=depth_mult)
+        self.pre    = SepConvGNAct(in_ch, hidden, depth_mult=depth_mult)
+        self.head   = QConv2d(hidden, 3, 1, quantize_weight=False)
+    def forward(self, feat, cond):
+        return torch.sigmoid(self.head(self.pre(self.block2(self.block1(feat, cond))))) * 255.0
+
 class Frame2StaticHead(nn.Module):
     def __init__(self, in_ch, hidden=64, depth_mult=1):
         super().__init__()
@@ -525,32 +580,29 @@ class Frame2StaticHead(nn.Module):
     def forward(self, feat):
         return torch.sigmoid(self.head(self.pre(self.block2(self.block1(feat))))) * 255.0
 
-class FrameHead(nn.Module):
-    def __init__(self, in_ch, cond_dim=48, hidden=64, depth_mult=1):
-        super().__init__()
-        self.block1 = FiLMSepResBlock(in_ch, cond_dim, depth_mult=depth_mult)
-        self.block2 = SepResBlock(in_ch, depth_mult=depth_mult)
-        self.pre    = SepConvGNAct(in_ch, hidden, depth_mult=depth_mult)
-        self.head   = QConv2d(hidden, 3, 1, quantize_weight=False)
-    def forward(self, feat, cond):
-        return torch.sigmoid(self.head(self.pre(self.block2(self.block1(feat, cond))))) * 255.0
 
 class JointFrameGenerator(nn.Module):
-    def __init__(self, num_classes=5, pose_dim=6, cond_dim=48, depth_mult=1):
+    def __init__(self, num_classes=5, pose_dim=POSE_DIM, cond_dim=COND_DIM, depth_mult=1):
         super().__init__()
         self.shared_trunk = SharedMaskDecoder(num_classes, emb_dim=6, c1=64, c2=80, depth_mult=depth_mult)
-        self.pose_mlp     = nn.Sequential(nn.Linear(pose_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
-        self.frame1_head  = FrameHead(in_ch=64, cond_dim=cond_dim, hidden=64, depth_mult=depth_mult)
-        self.frame2_head  = Frame2StaticHead(in_ch=64, hidden=64, depth_mult=depth_mult)
+        self.pose_mlp = nn.Sequential(
+            nn.Linear(pose_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
+        self.frame1_head = FrameHead(in_ch=64, cond_dim=cond_dim, hidden=64, depth_mult=depth_mult)
+        self.frame2_head = Frame2StaticHead(in_ch=64, hidden=64, depth_mult=depth_mult)
 
     def set_qat(self, enabled):
         for m in self.modules():
             if isinstance(m, (QConv2d, QEmbedding)): m.set_qat(enabled=enabled)
 
     def forward(self, mask2, pose6):
-        coords      = make_coord_grid(mask2.shape[0], 384, 512, mask2.device, torch.float32)
-        shared_feat = checkpoint.checkpoint(self.shared_trunk, mask2, coords, use_reentrant=False)
-        return self.frame1_head(shared_feat, self.pose_mlp(pose6)), checkpoint.checkpoint(self.frame2_head, shared_feat, use_reentrant=False)
+        coords = make_coord_grid(mask2.shape[0], NET_H, NET_W, mask2.device, torch.float32)
+        feat = checkpoint.checkpoint(self.shared_trunk, mask2, coords, use_reentrant=False)
+        cond = self.pose_mlp(pose6)
+        return (
+            self.frame1_head(feat, cond),
+            checkpoint.checkpoint(self.frame2_head, feat, use_reentrant=False),
+        )
+
 
 # ─── Training ─────────────────────────────────────────────────────────────────
 def apply_freeze_state(model, stage):
@@ -565,17 +617,18 @@ def apply_freeze_state(model, stage):
         model.shared_trunk.eval()
         model.frame2_head.eval()
 
+
 def train_run(run, generator, loader, device, archive_dir, aux_models, state_dict_to_load=None):
     segnet, posenet, dist_net = aux_models
     apply_freeze_state(generator, run.stage)
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, generator.parameters()),
-        lr=run.lr, betas=(0.9, 0.99)
-    )
+        lr=run.lr, betas=(0.9, 0.99))
     start_epoch, best_metric = 0, float("inf")
 
     latest_path = archive_dir / f"{run.name}_latest.pt"
+    ckpt = None
     if latest_path.exists():
         logging.info(f"Resuming {run.name}...")
         ckpt = torch.load(latest_path, map_location=device)
@@ -584,10 +637,10 @@ def train_run(run, generator, loader, device, archive_dir, aux_models, state_dic
         start_epoch  = ckpt["epoch"] + 1
         best_metric  = ckpt["best_metric"]
     elif state_dict_to_load is not None:
-        generator.load_state_dict(state_dict_to_load)
+        generator.load_state_dict(state_dict_to_load, strict=False)
 
     ema = EMA(generator, decay=run.ema_decay) if run.ema_decay > 0 else None
-    if ema and latest_path.exists() and ckpt.get("ema_state"):
+    if ema and ckpt is not None and ckpt.get("ema_state"):
         ema.shadow = {k: v.to(device) for k, v in ckpt["ema_state"].items()}
 
     qat_warmup = min(run.warmup_epochs, max(1, (run.epochs - run.qat_start_epoch) // 2)) \
@@ -609,8 +662,7 @@ def train_run(run, generator, loader, device, archive_dir, aux_models, state_dic
         if epoch == run.qat_start_epoch and run.qat_start_epoch > 0:
             optimizer = torch.optim.AdamW(
                 filter(lambda p: p.requires_grad, generator.parameters()),
-                lr=run.lr, betas=(0.9, 0.99)
-            )
+                lr=run.lr, betas=(0.9, 0.99))
             warmup_sch = torch.optim.lr_scheduler.LinearLR(optimizer, 0.01, 1.0, qat_warmup)
             main_sch   = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max(1, (run.epochs - epoch) - qat_warmup))
             scheduler  = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup_sch, main_sch], [qat_warmup])
@@ -624,26 +676,27 @@ def train_run(run, generator, loader, device, archive_dir, aux_models, state_dic
         batches = 0
 
         pbar = tqdm(loader, desc=f"{run.name} Ep{epoch+1}/{run.epochs}", leave=False)
-        for batch_rgb, in_mask2, in_pose6 in pbar:
+        for batch_rgb, in_mask, gt_mask2, in_pose6 in pbar:
             batch    = einops.rearrange(batch_rgb, "b t h w c -> b t c h w").float().to(device)
-            in_mask2 = in_mask2.to(device).long()
+            in_mask  = in_mask.to(device).long()
+            gt_mask2 = gt_mask2.to(device).long()
             in_pose6 = in_pose6.to(device).float()
 
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                real1 = F.interpolate(batch[:, 0], (384, 512), mode="bilinear", align_corners=False)
-                real2 = F.interpolate(batch[:, 1], (384, 512), mode="bilinear", align_corners=False)
+                real1 = F.interpolate(batch[:, 0], (NET_H, NET_W), mode="bilinear", align_corners=False)
+                real2 = F.interpolate(batch[:, 1], (NET_H, NET_W), mode="bilinear", align_corners=False)
                 gt_logits1, gt_logits2 = segnet(real1).float(), segnet(real2).float()
-                gt_mask1, gt_mask2     = gt_logits1.argmax(1), gt_logits2.argmax(1)
+                gt_mask1 = gt_logits1.argmax(1)
                 gt_pose = get_pose_tensor(posenet(posenet.preprocess_input(batch))).float()[..., :6]
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                pred1, pred2 = generator(in_mask2, in_pose6)
+                pred1, pred2 = generator(in_mask, in_pose6)
 
-                up1 = F.interpolate(pred1, (874, 1164), mode="bilinear", align_corners=False)
-                up2 = F.interpolate(pred2, (874, 1164), mode="bilinear", align_corners=False)
-                dn1 = F.interpolate(diff_round(up1.clamp(0, 255)), (384, 512), mode="bilinear", align_corners=False)
-                dn2 = F.interpolate(diff_round(up2.clamp(0, 255)), (384, 512), mode="bilinear", align_corners=False)
+                up1 = F.interpolate(pred1, (OUT_H, OUT_W), mode="bilinear", align_corners=False)
+                up2 = F.interpolate(pred2, (OUT_H, OUT_W), mode="bilinear", align_corners=False)
+                dn1 = F.interpolate(diff_round(up1.clamp(0, 255)), (NET_H, NET_W), mode="bilinear", align_corners=False)
+                dn2 = F.interpolate(diff_round(up2.clamp(0, 255)), (NET_H, NET_W), mode="bilinear", align_corners=False)
 
                 zero = torch.tensor(0.0, device=device)
                 loss_pose = loss_seg2 = loss_seg1 = loss_seg2_ce = loss_seg1_ce = zero
@@ -658,10 +711,9 @@ def train_run(run, generator, loader, device, archive_dir, aux_models, state_dic
                     with torch.no_grad():
                         boost2 = 1.0 + (logits2.argmax(1) != gt_mask2).float() * run.error_boost
                     loss_seg2_ce = (ce2 * boost2).mean()
-                    kl2          = kl_on_logits(logits2, gt_logits2) / (384 * 512)
+                    kl2          = kl_on_logits(logits2, gt_logits2) / (NET_H * NET_W)
                     loss_seg2    = 100.0 * (seg2_kl_w * kl2 + seg2_ce_w * 0.5 * run.ce_weight * loss_seg2_ce)
 
-                # Frame1 segnet loss: applied via fade schedule OR explicit weight (new)
                 do_seg1_fade  = frame1_sem_w > 0
                 do_seg1_fixed = run.frame1_seg_weight > 0
                 if do_seg1_fade or do_seg1_fixed:
@@ -672,7 +724,7 @@ def train_run(run, generator, loader, device, archive_dir, aux_models, state_dic
                     loss_seg1_ce = (ce1 * boost1).mean()
                     eff_w = frame1_sem_w if do_seg1_fade else run.frame1_seg_weight
                     if run.stage == Stage.JOINT:
-                        kl1       = kl_on_logits(logits1, gt_logits1) / (384 * 512)
+                        kl1       = kl_on_logits(logits1, gt_logits1) / (NET_H * NET_W)
                         loss_seg1 = 100.0 * eff_w * (seg2_kl_w * kl1 + seg2_ce_w * 0.5 * run.ce_weight * loss_seg1_ce)
                     else:
                         loss_seg1 = 100.0 * eff_w * run.ce_weight * loss_seg1_ce
@@ -681,7 +733,7 @@ def train_run(run, generator, loader, device, archive_dir, aux_models, state_dic
                     loss = loss_seg2
                 elif run.stage == Stage.FINETUNE:
                     loss = loss_seg1 + run.pose_weight * loss_pose * 10.0
-                else:  # JOINT
+                else:
                     loss = loss_seg2 + loss_seg1 + 30.0 * run.pose_weight * loss_pose
 
             assert_finite("loss", loss)
@@ -710,11 +762,14 @@ def train_run(run, generator, loader, device, archive_dir, aux_models, state_dic
             generator.eval()
             total_seg, total_pose, n_samples = 0.0, 0.0, 0
             with torch.inference_mode():
-                for batch_rgb, in_mask2, in_pose6 in tqdm(loader, desc="Eval", leave=False):
-                    p1, p2 = generator(in_mask2.to(device).long(), in_pose6.to(device).float())
+                for batch_rgb, in_mask, _, in_pose6 in tqdm(loader, desc="Eval", leave=False):
+                    p1, p2 = generator(
+                        in_mask.to(device).long(),
+                        in_pose6.to(device).float(),
+                    )
                     b_comp = torch.stack([
-                        F.interpolate(p1, (874, 1164), mode="bilinear", align_corners=False),
-                        F.interpolate(p2, (874, 1164), mode="bilinear", align_corners=False),
+                        F.interpolate(p1, (OUT_H, OUT_W), mode="bilinear", align_corners=False),
+                        F.interpolate(p2, (OUT_H, OUT_W), mode="bilinear", align_corners=False),
                     ], dim=1)
                     b_comp = einops.rearrange(b_comp, "b t c h w -> b t h w c").clamp(0, 255).round().to(torch.uint8)
                     pd, sd = dist_net.compute_distortion(batch_rgb.to(device), b_comp)
@@ -726,15 +781,14 @@ def train_run(run, generator, loader, device, archive_dir, aux_models, state_dic
             avg_pose = total_pose / max(1, n_samples)
             model_sz  = (archive_dir / "model.pt.br").stat().st_size if (archive_dir / "model.pt.br").exists() else 1_500_000
             mask_sz   = (archive_dir / "mask.obu.br").stat().st_size if (archive_dir / "mask.obu.br").exists() else 0
-            pose_sz   = (archive_dir / "pose.npy.br").stat().st_size if (archive_dir / "pose.npy.br").exists() else 0
+            pose_sz   = (archive_dir / "pose.bin.br").stat().st_size if (archive_dir / "pose.bin.br").exists() else 0
             total_bytes = model_sz + mask_sz + pose_sz
-            total_pixels = n_samples * 2 * 1164 * 874
+            total_pixels = n_samples * 2 * OUT_W * OUT_H
             rate_bpp = (total_bytes * 8.0) / max(1, total_pixels)
 
             scaled_seg  = 100.0 * avg_seg
             scaled_pose = math.sqrt(max(0, 10.0 * avg_pose))
             scaled_rate = 25.0 * rate_bpp
-
             eval_metric = scaled_seg + scaled_pose + scaled_rate
             logging.info(f"  [Eval] Score~{eval_metric:.4f} | "
                          f"Seg={scaled_seg:.4f} Pose={scaled_pose:.4f} Rate={scaled_rate:.4f}")
@@ -766,19 +820,24 @@ def train_run(run, generator, loader, device, archive_dir, aux_models, state_dic
     if latest_path.exists(): latest_path.unlink()
     return _load_best_fp4(generator, archive_dir / f"{run.name}_best_fp4.pt", device)
 
+
 def _load_best_fp4(model, path, device):
     load_fp4_state_dict(model, path, device)
     model.float()
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-# ─── Argument parsing & main ─────────────────────────────────────────────────
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--video-dir",   type=Path, default=ROOT_DIR / "videos")
     p.add_argument("--video-names", type=Path, default=ROOT_DIR / "public_test_video_names.txt")
     p.add_argument("--batch-size",  type=int,  default=4)
     p.add_argument("--device",      type=str,  default="cuda:0")
+    p.add_argument("--measure-only", action="store_true",
+                   help="Run only mask+pose extraction and dump archive sizes; skip training.")
     return p.parse_args()
+
 
 def main():
     args   = parse_args()
@@ -789,9 +848,8 @@ def main():
 
     logging.basicConfig(
         level=logging.INFO, format="%(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(archive_dir / "pipeline.log")]
-    )
-    logging.info("=== another_attempt compression pipeline ===")
+        handlers=[logging.StreamHandler(), logging.FileHandler(archive_dir / "pipeline.log")])
+    logging.info(f"=== another_attempt pipeline (mask CRF={MASK_CRF}) ===")
 
     segnet  = SegNet().eval().to(device)
     segnet.load_state_dict(load_file(segnet_sd_path, device=str(device)))
@@ -803,31 +861,36 @@ def main():
         for p in m.parameters(): p.requires_grad = False
 
     files = [l.strip() for l in args.video_names.read_text().splitlines() if l.strip()]
-    rgb_pairs_all = preload_video_pair_cache_dali(files, args.video_dir, args.batch_size, device)
+    try:
+        rgb_pairs_all = preload_video_pair_cache_dali(files, args.video_dir, args.batch_size, device)
+    except Exception as e:
+        logging.warning(f"DALI preload failed ({e!s:.120}); falling back to PyAV CPU decode.")
+        rgb_pairs_all = preload_video_pair_cache_av(files, args.video_dir)
 
-    mask_frames_all = extract_and_compress_masks(rgb_pairs_all, segnet, device, archive_dir)
-    pose6_all       = extract_and_compress_poses(rgb_pairs_all, posenet, device, archive_dir)
+    noisy_masks, gt_masks = extract_and_compress_masks(rgb_pairs_all, segnet, device, archive_dir)
+    pose6_all = extract_and_compress_poses(rgb_pairs_all, posenet, device, archive_dir)
 
-    loader    = CachedPairLoader(rgb_pairs_all, mask_frames_all, pose6_all, args.batch_size, device)
+    mask_sz = (archive_dir / "mask.obu.br").stat().st_size
+    pose_sz = (archive_dir / "pose.bin.br").stat().st_size
+    logging.info(f"Codec-only sizes: mask={mask_sz:,}B  pose={pose_sz:,}B  "
+                 f"non-model total={mask_sz + pose_sz:,}B")
+
+    if args.measure_only:
+        logging.info("--measure-only: skipping training.")
+        return
+
+    loader = CachedPairLoader(rgb_pairs_all, noisy_masks, gt_masks, pose6_all,
+                              args.batch_size, device)
     generator = JointFrameGenerator().to(device)
 
-    # ── Training pipeline ──────────────────────────────────────────────────
-    #
-    # Changes vs quantizr:
-    #   • ANCHOR: more QAT epochs (qat_start_epoch=150 vs 200)
-    #   • FINETUNE (run3): frame1_seg_weight=0.3 — explicit segnet loss for frame1
-    #                      instead of only pose loss (key new improvement)
-    #   • FINETUNE (run5): frame1_seg_weight=0.3 — maintained in final micro stage
-    #   • JOINT: more balanced loss with frame1 seg weight
-    #
     PIPELINE = [
         PipelineRun("run1_anchor",  Stage.ANCHOR,   400, 5e-4, qat_start_epoch=150, frame1_fade_epochs=60,  error_boost=9.0),
         PipelineRun("run2_boost",   Stage.ANCHOR,    80, 1e-5, qat_start_epoch=0,   frame1_fade_epochs=0,   error_boost=49.0),
         PipelineRun("run3_finetune",Stage.FINETUNE, 320, 5e-5, qat_start_epoch=100, frame1_fade_epochs=60,  pose_weight=1.0,
-                    frame1_seg_weight=0.3),  # segnet loss for frame1 in FINETUNE
+                    frame1_seg_weight=0.3),
         PipelineRun("run4_joint",   Stage.JOINT,    160, 1e-5, qat_start_epoch=0,   frame1_fade_epochs=40,  pose_weight=1.0),
         PipelineRun("run5_micro",   Stage.FINETUNE, 120, 5e-6, qat_start_epoch=0,   frame1_fade_epochs=0,   pose_weight=1.0,
-                    frame1_seg_weight=0.3),  # maintained in final micro stage
+                    frame1_seg_weight=0.3),
     ]
 
     current_sd = None
@@ -843,6 +906,7 @@ def main():
                                (segnet, posenet, dist_net), current_sd)
 
     logging.info("\nDone. Final model saved to archive/model.pt.br")
+
 
 if __name__ == "__main__":
     main()

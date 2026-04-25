@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 """
 another_attempt/inflate.py
-Wider generator: c1=64, c2=80 (matching compress.py).
+
+Format on disk (all files inside archive/):
+  model.pt.br  FP4-quantized + brotli'd state dict for the generator.
+  mask.obu.br  AV1 CRF=63 OBU of NET_W×NET_H mask frames (one per pair).
+  pose.bin.br  Brotli'd binary: 12 fp32 (per-dim mn, mx) + N_PAIRS*6 uint16.
 """
 import io, os, sys, tempfile
 from pathlib import Path
@@ -14,6 +18,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+
+NET_W, NET_H = 512, 384
+OUT_W, OUT_H = 1164, 874
+N_PAIRS_PER_FILE = 600
+COND_DIM = 48
+POSE_DIM = 6
 
 
 # ─── FP4 dequantization ───────────────────────────────────────────────────────
@@ -53,6 +63,16 @@ def get_decoded_state_dict(payload_data, device):
     for name, tensor in data["dense_fp16"].items():
         sd[name] = tensor.to(device).float() if torch.is_floating_point(tensor) else tensor.to(device)
     return sd
+
+
+# ─── Pose codec ───────────────────────────────────────────────────────────────
+def decode_pose_bin(payload: bytes) -> torch.Tensor:
+    header = np.frombuffer(payload[: 12 * 4], dtype=np.float32)
+    mn, mx = header[:POSE_DIM].copy(), header[POSE_DIM : 2 * POSE_DIM].copy()
+    body = np.frombuffer(payload[12 * 4 :], dtype=np.uint16).reshape(-1, POSE_DIM).astype(np.float32)
+    rng = np.maximum(mx - mn, 1e-9)
+    pose = mn[None, :] + body / 65535.0 * rng[None, :]
+    return torch.from_numpy(pose).float().contiguous()
 
 
 # ─── Architecture (inference-only) — must match compress.py exactly ──────────
@@ -120,10 +140,10 @@ class SharedMaskDecoder(nn.Module):
         self.fuse_block = SepResBlock(c1, depth_mult=depth_mult)
 
     def forward(self, mask2, coords):
-        e2    = self.embedding(mask2.long()).permute(0, 3, 1, 2)
-        e2_up = F.interpolate(e2, size=coords.shape[-2:], mode="bilinear", align_corners=False)
-        s     = self.stem_block(self.stem_conv(torch.cat([e2_up, coords], dim=1)))
-        z     = self.up(self.down_block(self.down_conv(s)))
+        e2     = self.embedding(mask2.long()).permute(0, 3, 1, 2)
+        e2_up  = F.interpolate(e2, size=coords.shape[-2:], mode="bilinear", align_corners=False)
+        s      = self.stem_block(self.stem_conv(torch.cat([e2_up, coords], dim=1)))
+        z      = self.up(self.down_block(self.down_conv(s)))
         return self.fuse_block(self.fuse(torch.cat([z, s], dim=1)))
 
 class Frame2StaticHead(nn.Module):
@@ -137,7 +157,7 @@ class Frame2StaticHead(nn.Module):
         return torch.sigmoid(self.head(self.pre(self.block2(self.block1(feat))))) * 255.0
 
 class FrameHead(nn.Module):
-    def __init__(self, in_ch, cond_dim=48, hidden=64, depth_mult=1):
+    def __init__(self, in_ch, cond_dim=COND_DIM, hidden=64, depth_mult=1):
         super().__init__()
         self.block1 = FiLMSepResBlock(in_ch, cond_dim, depth_mult=depth_mult)
         self.block2 = SepResBlock(in_ch, depth_mult=depth_mult)
@@ -147,16 +167,16 @@ class FrameHead(nn.Module):
         return torch.sigmoid(self.head(self.pre(self.block2(self.block1(feat, cond))))) * 255.0
 
 class JointFrameGenerator(nn.Module):
-    def __init__(self, num_classes=5, pose_dim=6, cond_dim=48, depth_mult=1):
+    def __init__(self, num_classes=5, pose_dim=POSE_DIM, cond_dim=COND_DIM, depth_mult=1):
         super().__init__()
         self.shared_trunk = SharedMaskDecoder(num_classes, emb_dim=6, c1=64, c2=80, depth_mult=depth_mult)
-        self.pose_mlp     = nn.Sequential(nn.Linear(pose_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
-        self.frame1_head  = FrameHead(in_ch=64, cond_dim=cond_dim, hidden=64, depth_mult=depth_mult)
-        self.frame2_head  = Frame2StaticHead(in_ch=64, hidden=64, depth_mult=depth_mult)
+        self.pose_mlp = nn.Sequential(
+            nn.Linear(pose_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
+        self.frame1_head = FrameHead(in_ch=64, cond_dim=cond_dim, hidden=64, depth_mult=depth_mult)
+        self.frame2_head = Frame2StaticHead(in_ch=64, hidden=64, depth_mult=depth_mult)
 
     def forward(self, mask2, pose6):
-        b      = mask2.shape[0]
-        coords = make_coord_grid(b, 384, 512, mask2.device, torch.float32)
+        coords = make_coord_grid(mask2.shape[0], NET_H, NET_W, mask2.device, torch.float32)
         feat   = self.shared_trunk(mask2, coords)
         return self.frame1_head(feat, self.pose_mlp(pose6)), self.frame2_head(feat)
 
@@ -168,7 +188,6 @@ def make_coord_grid(batch, height, width, device, dtype):
     return grid.unsqueeze(0).expand(batch, -1, -1, -1)
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
 def load_mask_video(path):
     container = av.open(path)
     frames = []
@@ -179,7 +198,6 @@ def load_mask_video(path):
     return torch.from_numpy(np.stack(frames)).contiguous()
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     if len(sys.argv) < 4:
         print("Usage: python inflate.py <data_dir> <output_dir> <file_list_txt>")
@@ -193,36 +211,31 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     files  = [l.strip() for l in file_list_path.read_text().splitlines() if l.strip()]
 
-    # 1. Load model
     with open(data_dir / "model.pt.br", "rb") as f:
         weights_data = brotli.decompress(f.read())
     generator = JointFrameGenerator().to(device)
     generator.load_state_dict(get_decoded_state_dict(weights_data, device), strict=True)
     generator.eval()
 
-    # 2. Load mask video (lossless AV1, brotli-wrapped)
     with tempfile.NamedTemporaryFile(suffix=".obu", delete=False) as tmp:
         tmp.write(brotli.decompress(open(data_dir / "mask.obu.br", "rb").read()))
         tmp_path = tmp.name
     mask_frames_all = load_mask_video(tmp_path)
     os.remove(tmp_path)
 
-    # 3. Load poses
-    pose_bytes      = brotli.decompress(open(data_dir / "pose.npy.br", "rb").read())
-    pose_frames_all = torch.from_numpy(np.load(io.BytesIO(pose_bytes))).float()
+    pose_payload    = brotli.decompress(open(data_dir / "pose.bin.br", "rb").read())
+    pose_frames_all = decode_pose_bin(pose_payload)
 
-    out_h, out_w   = 874, 1164
-    batch_size     = 4
-    pairs_per_file = 600
-    cursor         = 0
+    batch_size = 4
+    cursor     = 0
 
     with torch.inference_mode():
         for file_name in files:
             base_name  = os.path.splitext(file_name)[0]
             raw_out    = out_dir / f"{base_name}.raw"
-            file_masks = mask_frames_all[cursor : cursor + pairs_per_file]
-            file_poses = pose_frames_all[cursor : cursor + pairs_per_file]
-            cursor    += pairs_per_file
+            file_masks = mask_frames_all[cursor : cursor + N_PAIRS_PER_FILE]
+            file_poses = pose_frames_all[cursor : cursor + N_PAIRS_PER_FILE]
+            cursor    += N_PAIRS_PER_FILE
 
             with open(raw_out, "wb") as f_out:
                 for i in tqdm(range(0, file_masks.shape[0], batch_size), desc=f"Decoding {file_name}"):
@@ -230,8 +243,8 @@ def main():
                     p = file_poses[i:i+batch_size].to(device).float()
 
                     f1, f2 = generator(m, p)
-                    f1_up  = F.interpolate(f1, (out_h, out_w), mode="bilinear", align_corners=False)
-                    f2_up  = F.interpolate(f2, (out_h, out_w), mode="bilinear", align_corners=False)
+                    f1_up  = F.interpolate(f1, (OUT_H, OUT_W), mode="bilinear", align_corners=False)
+                    f2_up  = F.interpolate(f2, (OUT_H, OUT_W), mode="bilinear", align_corners=False)
 
                     batch_comp = einops.rearrange(
                         torch.stack([f1_up, f2_up], dim=1),
