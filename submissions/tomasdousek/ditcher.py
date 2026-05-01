@@ -1122,7 +1122,7 @@ def compress(video_dir, out_path, model_path=Path(MODEL_FILE), mask_crf=50, comp
 # ─── Dekomprese ───────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def decompress(compressed_path, output_path, device=torch.device("cpu")):
+def decompress(compressed_path, output_path, device=torch.device("cuda")):
     print("Inflating to raw.")
     with open(compressed_path / META_FILE, "rb") as f:
         meta = pickle.load(f)
