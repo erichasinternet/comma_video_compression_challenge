@@ -1,0 +1,1586 @@
+// Static arithmetic coder audit for exact qpose/Quantizr masks.
+//
+// This is not an inflate-ready submission codec yet. It verifies whether the
+// p6 raster context entropy oracle can be approached by an actual coder.
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr uint8_t SENTINEL = 5;
+constexpr int CTX_COUNT = 216;
+constexpr int CTX5_COUNT = 7776;
+constexpr int CTX6_COUNT = 46656;
+constexpr int CTX7_COUNT = 279936;
+constexpr int CTX8_COUNT = 1679616;
+constexpr int CTX9_COUNT = 10077696;
+constexpr int EVENT_SYMS = 4;
+constexpr int EVENT5_SYMS = 5;
+constexpr int EVENT6_SYMS = 6;
+constexpr int CLASS_SYMS = 5;
+constexpr uint32_t TOP = 0xFFFFFFFFu;
+constexpr uint32_t HALF = 0x80000000u;
+constexpr uint32_t FIRST_QTR = 0x40000000u;
+constexpr uint32_t THIRD_QTR = 0xC0000000u;
+constexpr uint32_t SCALE_TOTAL = 4096;
+
+struct Model {
+  std::array<std::array<uint16_t, EVENT_SYMS>, CTX_COUNT> event_freq{};
+  std::array<std::array<uint16_t, CLASS_SYMS>, CTX_COUNT> class_freq{};
+};
+
+struct AdaptiveModel {
+  std::array<std::array<uint16_t, EVENT_SYMS>, CTX5_COUNT> event_freq{};
+  std::array<std::array<uint16_t, CLASS_SYMS>, CTX5_COUNT> class_freq{};
+
+  AdaptiveModel() {
+    for (auto& row : event_freq) row.fill(1);
+    for (auto& row : class_freq) row.fill(1);
+  }
+};
+
+struct AdaptiveModel6 {
+  std::array<std::array<uint16_t, EVENT_SYMS>, CTX6_COUNT> event_freq{};
+  std::array<std::array<uint16_t, CLASS_SYMS>, CTX6_COUNT> class_freq{};
+
+  AdaptiveModel6() {
+    for (auto& row : event_freq) row.fill(1);
+    for (auto& row : class_freq) row.fill(1);
+  }
+};
+
+struct AdaptiveModel7 {
+  std::vector<std::array<uint16_t, EVENT_SYMS>> event_freq;
+  std::vector<std::array<uint16_t, CLASS_SYMS>> class_freq;
+
+  AdaptiveModel7() : event_freq(CTX7_COUNT), class_freq(CTX7_COUNT) {
+    for (auto& row : event_freq) row.fill(1);
+    for (auto& row : class_freq) row.fill(1);
+  }
+};
+
+struct AdaptiveModel8 {
+  std::vector<std::array<uint16_t, EVENT_SYMS>> event_freq;
+  std::vector<std::array<uint16_t, CLASS_SYMS>> class_freq;
+
+  AdaptiveModel8() : event_freq(CTX8_COUNT), class_freq(CTX8_COUNT) {
+    for (auto& row : event_freq) row.fill(1);
+    for (auto& row : class_freq) row.fill(1);
+  }
+};
+
+struct AdaptiveModel9 {
+  std::vector<std::array<uint16_t, EVENT_SYMS>> event_freq;
+  std::vector<std::array<uint16_t, CLASS_SYMS>> class_freq;
+
+  explicit AdaptiveModel9(
+      std::array<uint16_t, EVENT_SYMS> event_prior = {1, 1, 1, 1},
+      std::array<uint16_t, CLASS_SYMS> class_prior = {1, 1, 1, 1, 1})
+      : event_freq(CTX9_COUNT), class_freq(CTX9_COUNT) {
+    for (auto& row : event_freq) row = event_prior;
+    for (auto& row : class_freq) row = class_prior;
+  }
+};
+
+struct AdaptiveModel9E6 {
+  std::vector<std::array<uint16_t, EVENT6_SYMS>> event_freq;
+  std::vector<std::array<uint16_t, CLASS_SYMS>> class_freq;
+
+  AdaptiveModel9E6() : event_freq(CTX9_COUNT), class_freq(CTX9_COUNT) {
+    for (auto& row : event_freq) row.fill(1);
+    for (auto& row : class_freq) row.fill(1);
+  }
+};
+
+struct AdaptiveModel9E5 {
+  std::vector<std::array<uint16_t, EVENT5_SYMS>> event_freq;
+  std::vector<std::array<uint16_t, CLASS_SYMS>> class_freq;
+
+  AdaptiveModel9E5() : event_freq(CTX9_COUNT), class_freq(CTX9_COUNT) {
+    for (auto& row : event_freq) row.fill(1);
+    for (auto& row : class_freq) row.fill(1);
+  }
+};
+
+struct BitWriter {
+  std::vector<uint8_t> bytes;
+  uint8_t cur = 0;
+  int fill = 0;
+
+  void bit(int b) {
+    cur = static_cast<uint8_t>((cur << 1) | (b & 1));
+    fill++;
+    if (fill == 8) {
+      bytes.push_back(cur);
+      cur = 0;
+      fill = 0;
+    }
+  }
+
+  void finish() {
+    if (fill) {
+      cur <<= (8 - fill);
+      bytes.push_back(cur);
+      cur = 0;
+      fill = 0;
+    }
+  }
+};
+
+struct BitReader {
+  const std::vector<uint8_t>& bytes;
+  size_t pos = 0;
+  int left = 0;
+  uint8_t cur = 0;
+
+  explicit BitReader(const std::vector<uint8_t>& data) : bytes(data) {}
+
+  int bit() {
+    if (left == 0) {
+      cur = pos < bytes.size() ? bytes[pos++] : 0;
+      left = 8;
+    }
+    int b = (cur >> 7) & 1;
+    cur <<= 1;
+    left--;
+    return b;
+  }
+};
+
+struct ArithmeticEncoder {
+  uint32_t low = 0;
+  uint32_t high = TOP;
+  uint32_t pending = 0;
+  BitWriter writer;
+
+  void output_bit_plus_pending(int b) {
+    writer.bit(b);
+    while (pending) {
+      writer.bit(!b);
+      pending--;
+    }
+  }
+
+  void encode(uint32_t cum_low, uint32_t cum_high, uint32_t total) {
+    uint64_t range = static_cast<uint64_t>(high) - low + 1ull;
+    high = static_cast<uint32_t>(low + (range * cum_high) / total - 1ull);
+    low = static_cast<uint32_t>(low + (range * cum_low) / total);
+    while (true) {
+      if (high < HALF) {
+        output_bit_plus_pending(0);
+      } else if (low >= HALF) {
+        output_bit_plus_pending(1);
+        low -= HALF;
+        high -= HALF;
+      } else if (low >= FIRST_QTR && high < THIRD_QTR) {
+        pending++;
+        low -= FIRST_QTR;
+        high -= FIRST_QTR;
+      } else {
+        break;
+      }
+      low <<= 1;
+      high = (high << 1) | 1u;
+    }
+  }
+
+  std::vector<uint8_t> finish() {
+    pending++;
+    if (low < FIRST_QTR) {
+      output_bit_plus_pending(0);
+    } else {
+      output_bit_plus_pending(1);
+    }
+    writer.finish();
+    return std::move(writer.bytes);
+  }
+};
+
+struct ArithmeticDecoder {
+  uint32_t low = 0;
+  uint32_t high = TOP;
+  uint32_t value = 0;
+  BitReader reader;
+
+  explicit ArithmeticDecoder(const std::vector<uint8_t>& data) : reader(data) {
+    for (int i = 0; i < 32; i++) value = (value << 1) | reader.bit();
+  }
+
+  uint32_t scaled(uint32_t total) const {
+    uint64_t range = static_cast<uint64_t>(high) - low + 1ull;
+    return static_cast<uint32_t>((((static_cast<uint64_t>(value) - low + 1ull) * total) - 1ull) / range);
+  }
+
+  void update(uint32_t cum_low, uint32_t cum_high, uint32_t total) {
+    uint64_t range = static_cast<uint64_t>(high) - low + 1ull;
+    high = static_cast<uint32_t>(low + (range * cum_high) / total - 1ull);
+    low = static_cast<uint32_t>(low + (range * cum_low) / total);
+    while (true) {
+      if (high < HALF) {
+        // no-op
+      } else if (low >= HALF) {
+        value -= HALF;
+        low -= HALF;
+        high -= HALF;
+      } else if (low >= FIRST_QTR && high < THIRD_QTR) {
+        value -= FIRST_QTR;
+        low -= FIRST_QTR;
+        high -= FIRST_QTR;
+      } else {
+        break;
+      }
+      low <<= 1;
+      high = (high << 1) | 1u;
+      value = (value << 1) | static_cast<uint32_t>(reader.bit());
+    }
+  }
+};
+
+std::vector<uint8_t> read_file(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("failed to open input: " + path);
+  return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+void write_file(const std::string& path, const std::vector<uint8_t>& data) {
+  std::ofstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("failed to open output: " + path);
+  f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+}
+
+int ctx_id(uint8_t prev, uint8_t left, uint8_t up) {
+  return static_cast<int>(prev) * 36 + static_cast<int>(left) * 6 + static_cast<int>(up);
+}
+
+uint8_t get_prev(const std::vector<uint8_t>& x, size_t frame_size, int t, int y, int w, int xcoord) {
+  if (t == 0) return SENTINEL;
+  return x[static_cast<size_t>(t - 1) * frame_size + static_cast<size_t>(y) * w + xcoord];
+}
+
+uint8_t get_left(const std::vector<uint8_t>& decoded, size_t base, int xcoord) {
+  if (xcoord == 0) return SENTINEL;
+  return decoded[base + static_cast<size_t>(xcoord - 1)];
+}
+
+uint8_t get_up(const std::vector<uint8_t>& decoded, size_t base, int y, int w, int xcoord) {
+  if (y == 0) return SENTINEL;
+  return decoded[base - static_cast<size_t>(w) + xcoord];
+}
+
+uint8_t get_up_left(const std::vector<uint8_t>& decoded, size_t base, int y, int w, int xcoord) {
+  if (y == 0 || xcoord == 0) return SENTINEL;
+  return decoded[base - static_cast<size_t>(w) + xcoord - 1];
+}
+
+uint8_t get_up_right(const std::vector<uint8_t>& decoded, size_t base, int y, int w, int xcoord) {
+  if (y == 0 || xcoord + 1 >= w) return SENTINEL;
+  return decoded[base - static_cast<size_t>(w) + xcoord + 1];
+}
+
+uint8_t get_left2(const std::vector<uint8_t>& decoded, size_t base, int xcoord) {
+  if (xcoord < 2) return SENTINEL;
+  return decoded[base + static_cast<size_t>(xcoord - 2)];
+}
+
+uint8_t get_up2(const std::vector<uint8_t>& decoded, size_t base, int y, int w, int xcoord) {
+  if (y < 2) return SENTINEL;
+  return decoded[base - static_cast<size_t>(2 * w) + xcoord];
+}
+
+uint8_t get_prev_right(const std::vector<uint8_t>& x, size_t frame_size, int t, int y, int w, int xcoord) {
+  if (t == 0 || xcoord + 1 >= w) return SENTINEL;
+  return x[static_cast<size_t>(t - 1) * frame_size + static_cast<size_t>(y) * w + xcoord + 1];
+}
+
+uint8_t get_prev_left(const std::vector<uint8_t>& x, size_t frame_size, int t, int y, int w, int xcoord) {
+  if (t == 0 || xcoord == 0) return SENTINEL;
+  return x[static_cast<size_t>(t - 1) * frame_size + static_cast<size_t>(y) * w + xcoord - 1];
+}
+
+uint8_t get_prev_down(const std::vector<uint8_t>& x, size_t frame_size, int t, int y, int h, int w, int xcoord) {
+  if (t == 0 || y + 1 >= h) return SENTINEL;
+  return x[static_cast<size_t>(t - 1) * frame_size + static_cast<size_t>(y + 1) * w + xcoord];
+}
+
+uint8_t get_prev_up(const std::vector<uint8_t>& x, size_t frame_size, int t, int y, int w, int xcoord) {
+  if (t == 0 || y == 0) return SENTINEL;
+  return x[static_cast<size_t>(t - 1) * frame_size + static_cast<size_t>(y - 1) * w + xcoord];
+}
+
+uint8_t get_prev_down_left(const std::vector<uint8_t>& x, size_t frame_size, int t, int y, int h, int w, int xcoord) {
+  if (t == 0 || y + 1 >= h || xcoord == 0) return SENTINEL;
+  return x[static_cast<size_t>(t - 1) * frame_size + static_cast<size_t>(y + 1) * w + xcoord - 1];
+}
+
+uint8_t get_prev_down_right(const std::vector<uint8_t>& x, size_t frame_size, int t, int y, int h, int w, int xcoord) {
+  if (t == 0 || y + 1 >= h || xcoord + 1 >= w) return SENTINEL;
+  return x[static_cast<size_t>(t - 1) * frame_size + static_cast<size_t>(y + 1) * w + xcoord + 1];
+}
+
+uint8_t event_for(uint8_t cls, uint8_t prev, uint8_t left, uint8_t up) {
+  if (cls == prev) return 0;
+  if (cls == left) return 1;
+  if (cls == up) return 2;
+  return 3;
+}
+
+uint8_t event6_for(uint8_t cls, uint8_t prev, uint8_t left, uint8_t up, uint8_t up2, uint8_t left2) {
+  if (cls == prev) return 0;
+  if (cls == left) return 1;
+  if (cls == up) return 2;
+  if (cls == up2) return 3;
+  if (cls == left2) return 4;
+  return 5;
+}
+
+uint8_t event5_for(uint8_t cls, uint8_t prev, uint8_t left, uint8_t up, uint8_t extra) {
+  if (cls == prev) return 0;
+  if (cls == left) return 1;
+  if (cls == up) return 2;
+  if (cls == extra) return 3;
+  return 4;
+}
+
+int ctx5_id(uint8_t prev, uint8_t left, uint8_t up, uint8_t up_left, uint8_t up_right) {
+  return static_cast<int>(prev) * 1296 + static_cast<int>(left) * 216 + static_cast<int>(up) * 36 + static_cast<int>(up_left) * 6 + static_cast<int>(up_right);
+}
+
+int ctx6_id(uint8_t prev, uint8_t left, uint8_t up, uint8_t up_left, uint8_t up_right, uint8_t prev_right) {
+  return static_cast<int>(prev) * 7776 + static_cast<int>(left) * 1296 + static_cast<int>(up) * 216 + static_cast<int>(up_left) * 36 + static_cast<int>(up_right) * 6 + static_cast<int>(prev_right);
+}
+
+int ctx7_id(uint8_t prev, uint8_t left, uint8_t up, uint8_t up_left, uint8_t up_right, uint8_t prev_right, uint8_t prev_down) {
+  return static_cast<int>(prev) * 46656 + static_cast<int>(left) * 7776 + static_cast<int>(up) * 1296 + static_cast<int>(up_left) * 216 + static_cast<int>(up_right) * 36 + static_cast<int>(prev_right) * 6 + static_cast<int>(prev_down);
+}
+
+int ctx8_id(uint8_t prev, uint8_t left, uint8_t up, uint8_t up_left, uint8_t up_right, uint8_t prev_right, uint8_t prev_down, uint8_t prev_left) {
+  return ctx7_id(prev, left, up, up_left, up_right, prev_right, prev_down) * 6 + static_cast<int>(prev_left);
+}
+
+int ctx9_id(uint8_t prev, uint8_t left, uint8_t up, uint8_t up_left, uint8_t up_right, uint8_t prev_right, uint8_t prev_down, uint8_t up2, uint8_t extra) {
+  return ctx8_id(prev, left, up, up_left, up_right, prev_right, prev_down, up2) * 6 + static_cast<int>(extra);
+}
+
+template <size_t N>
+std::array<uint16_t, N> scale_counts(const std::array<uint64_t, N>& counts) {
+  std::array<uint16_t, N> out{};
+  uint64_t total = 0;
+  for (auto c : counts) total += c;
+  if (total == 0) {
+    for (size_t i = 0; i < N; i++) out[i] = 1;
+    return out;
+  }
+  uint32_t used = 0;
+  for (size_t i = 0; i < N; i++) {
+    uint32_t v = std::max<uint32_t>(1, static_cast<uint32_t>((counts[i] * SCALE_TOTAL) / total));
+    out[i] = static_cast<uint16_t>(v);
+    used += v;
+  }
+  while (used > SCALE_TOTAL) {
+    size_t best = 0;
+    for (size_t i = 1; i < N; i++) {
+      if (out[i] > out[best]) best = i;
+    }
+    if (out[best] <= 1) break;
+    out[best]--;
+    used--;
+  }
+  while (used < SCALE_TOTAL) {
+    size_t best = 0;
+    for (size_t i = 1; i < N; i++) {
+      if (counts[i] > counts[best]) best = i;
+    }
+    out[best]++;
+    used++;
+  }
+  return out;
+}
+
+Model build_model(const std::vector<uint8_t>& x, int t_count, int h, int w) {
+  std::array<std::array<uint64_t, EVENT_SYMS>, CTX_COUNT> event_counts{};
+  std::array<std::array<uint64_t, CLASS_SYMS>, CTX_COUNT> class_counts{};
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        int ctx = ctx_id(prev, left, up);
+        uint8_t ev = event_for(cls, prev, left, up);
+        event_counts[ctx][ev]++;
+        if (ev == 3) class_counts[ctx][cls]++;
+        decoded[idx] = cls;
+      }
+    }
+  }
+  Model model;
+  for (int ctx = 0; ctx < CTX_COUNT; ctx++) {
+    model.event_freq[ctx] = scale_counts<EVENT_SYMS>(event_counts[ctx]);
+    model.class_freq[ctx] = scale_counts<CLASS_SYMS>(class_counts[ctx]);
+  }
+  return model;
+}
+
+template <size_t N>
+void encode_symbol(ArithmeticEncoder& enc, const std::array<uint16_t, N>& freq, uint32_t sym) {
+  uint32_t cum = 0;
+  for (uint32_t i = 0; i < sym; i++) cum += freq[i];
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < N; i++) total += freq[i];
+  enc.encode(cum, cum + freq[sym], total);
+}
+
+template <size_t N>
+void update_adaptive(std::array<uint16_t, N>& freq, uint32_t sym) {
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < N; i++) total += freq[i];
+  if (total >= SCALE_TOTAL) {
+    total = 0;
+    for (uint32_t i = 0; i < N; i++) {
+      freq[i] = static_cast<uint16_t>(std::max<uint32_t>(1, (freq[i] + 1) >> 1));
+      total += freq[i];
+    }
+  }
+  (void)total;
+  if (freq[sym] < 65535) freq[sym]++;
+}
+
+template <size_t N>
+uint32_t decode_symbol(ArithmeticDecoder& dec, const std::array<uint16_t, N>& freq) {
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < N; i++) total += freq[i];
+  uint32_t v = dec.scaled(total);
+  uint32_t cum = 0;
+  for (uint32_t sym = 0; sym < N; sym++) {
+    uint32_t next = cum + freq[sym];
+    if (v < next) {
+      dec.update(cum, next, total);
+      return sym;
+    }
+    cum = next;
+  }
+  throw std::runtime_error("decode_symbol out of range");
+}
+
+template <size_t N>
+std::array<uint16_t, N> mix_freq(const std::array<uint16_t, N>& high, const std::array<uint16_t, N>& low, int low_shift) {
+  std::array<uint16_t, N> out{};
+  for (size_t i = 0; i < N; i++) {
+    uint32_t borrowed = (static_cast<uint32_t>(low[i]) + ((1u << low_shift) - 1u)) >> low_shift;
+    out[i] = static_cast<uint16_t>(std::min<uint32_t>(65535, static_cast<uint32_t>(high[i]) + borrowed));
+  }
+  return out;
+}
+
+std::vector<uint8_t> encode_payload(const std::vector<uint8_t>& x, int t_count, int h, int w, const Model& model) {
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        int ctx = ctx_id(prev, left, up);
+        uint8_t ev = event_for(cls, prev, left, up);
+        encode_symbol<EVENT_SYMS>(enc, model.event_freq[ctx], ev);
+        if (ev == 3) encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload(const std::vector<uint8_t>& bits, int t_count, int h, int w, const Model& model) {
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        int ctx = ctx_id(prev, left, up);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT_SYMS>(dec, model.event_freq[ctx]));
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<uint8_t> encode_payload_adaptive5(const std::vector<uint8_t>& x, int t_count, int h, int w) {
+  AdaptiveModel model;
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        int ctx = ctx5_id(prev, left, up, ul, ur);
+        uint8_t ev = event_for(cls, prev, left, up);
+        encode_symbol<EVENT_SYMS>(enc, model.event_freq[ctx], ev);
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        if (ev == 3) {
+          encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive5(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  AdaptiveModel model;
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        int ctx = ctx5_id(prev, left, up, ul, ur);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT_SYMS>(dec, model.event_freq[ctx]));
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else {
+          cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<uint8_t> encode_payload_adaptive6pr(const std::vector<uint8_t>& x, int t_count, int h, int w) {
+  AdaptiveModel6 model;
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(x, frame_size, t, y, w, xcoord);
+        int ctx = ctx6_id(prev, left, up, ul, ur, pr);
+        uint8_t ev = event_for(cls, prev, left, up);
+        encode_symbol<EVENT_SYMS>(enc, model.event_freq[ctx], ev);
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        if (ev == 3) {
+          encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive6pr(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  AdaptiveModel6 model;
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(out, frame_size, t, y, w, xcoord);
+        int ctx = ctx6_id(prev, left, up, ul, ur, pr);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT_SYMS>(dec, model.event_freq[ctx]));
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else {
+          cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<uint8_t> encode_payload_adaptive7prpd(const std::vector<uint8_t>& x, int t_count, int h, int w) {
+  AdaptiveModel7 model;
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(x, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(x, frame_size, t, y, h, w, xcoord);
+        int ctx = ctx7_id(prev, left, up, ul, ur, pr, pd);
+        uint8_t ev = event_for(cls, prev, left, up);
+        encode_symbol<EVENT_SYMS>(enc, model.event_freq[ctx], ev);
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        if (ev == 3) {
+          encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive7prpd(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  AdaptiveModel7 model;
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(out, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(out, frame_size, t, y, h, w, xcoord);
+        int ctx = ctx7_id(prev, left, up, ul, ur, pr, pd);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT_SYMS>(dec, model.event_freq[ctx]));
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else {
+          cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<uint8_t> encode_payload_adaptive8prpdpl(const std::vector<uint8_t>& x, int t_count, int h, int w) {
+  AdaptiveModel8 model;
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(x, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(x, frame_size, t, y, h, w, xcoord);
+        uint8_t pl = get_prev_left(x, frame_size, t, y, w, xcoord);
+        int ctx = ctx8_id(prev, left, up, ul, ur, pr, pd, pl);
+        uint8_t ev = event_for(cls, prev, left, up);
+        encode_symbol<EVENT_SYMS>(enc, model.event_freq[ctx], ev);
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        if (ev == 3) {
+          encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive8prpdpl(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  AdaptiveModel8 model;
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(out, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(out, frame_size, t, y, h, w, xcoord);
+        uint8_t pl = get_prev_left(out, frame_size, t, y, w, xcoord);
+        int ctx = ctx8_id(prev, left, up, ul, ur, pr, pd, pl);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT_SYMS>(dec, model.event_freq[ctx]));
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else {
+          cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+uint8_t get_extra8_value(const std::vector<uint8_t>& src, const std::vector<uint8_t>& decoded, size_t frame_size, size_t base, int t, int y, int h, int w, int xcoord, int extra_kind) {
+  switch (extra_kind) {
+    case 0: return get_prev_left(src, frame_size, t, y, w, xcoord);
+    case 1: return get_prev_up(src, frame_size, t, y, w, xcoord);
+    case 2: return get_left2(decoded, base, xcoord);
+    case 3: return get_up2(decoded, base, y, w, xcoord);
+    case 4: return get_prev_down_left(src, frame_size, t, y, h, w, xcoord);
+    case 5: return get_prev_down_right(src, frame_size, t, y, h, w, xcoord);
+    default: return SENTINEL;
+  }
+}
+
+std::vector<uint8_t> encode_payload_adaptive8x(const std::vector<uint8_t>& x, int t_count, int h, int w, int extra_kind) {
+  AdaptiveModel8 model;
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(x, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(x, frame_size, t, y, h, w, xcoord);
+        uint8_t extra = get_extra8_value(x, decoded, frame_size, base, t, y, h, w, xcoord, extra_kind);
+        int ctx = ctx8_id(prev, left, up, ul, ur, pr, pd, extra);
+        uint8_t ev = event_for(cls, prev, left, up);
+        encode_symbol<EVENT_SYMS>(enc, model.event_freq[ctx], ev);
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        if (ev == 3) {
+          encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive8x(const std::vector<uint8_t>& bits, int t_count, int h, int w, int extra_kind) {
+  AdaptiveModel8 model;
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(out, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(out, frame_size, t, y, h, w, xcoord);
+        uint8_t extra = get_extra8_value(out, out, frame_size, base, t, y, h, w, xcoord, extra_kind);
+        int ctx = ctx8_id(prev, left, up, ul, ur, pr, pd, extra);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT_SYMS>(dec, model.event_freq[ctx]));
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else {
+          cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<uint8_t> encode_payload_adaptive9x(const std::vector<uint8_t>& x, int t_count, int h, int w, int extra_kind) {
+  AdaptiveModel9 model;
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(x, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(x, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(decoded, base, y, w, xcoord);
+        uint8_t extra = get_extra8_value(x, decoded, frame_size, base, t, y, h, w, xcoord, extra_kind);
+        int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, extra);
+        uint8_t ev = event_for(cls, prev, left, up);
+        encode_symbol<EVENT_SYMS>(enc, model.event_freq[ctx], ev);
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        if (ev == 3) {
+          encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive9x(const std::vector<uint8_t>& bits, int t_count, int h, int w, int extra_kind) {
+  AdaptiveModel9 model;
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(out, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(out, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(out, base, y, w, xcoord);
+        uint8_t extra = get_extra8_value(out, out, frame_size, base, t, y, h, w, xcoord, extra_kind);
+        int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, extra);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT_SYMS>(dec, model.event_freq[ctx]));
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else {
+          cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+std::array<uint16_t, EVENT_SYMS> event4_prior(int prior_kind) {
+  switch (prior_kind) {
+    case 1: return {8, 2, 2, 1};
+    case 2: return {16, 4, 4, 1};
+    case 3: return {32, 4, 4, 1};
+    case 4: return {32, 8, 8, 1};
+    case 5: return {64, 8, 8, 1};
+    case 6: return {16, 8, 8, 1};
+    default: return {1, 1, 1, 1};
+  }
+}
+
+std::vector<uint8_t> encode_payload_adaptive9x_prior(const std::vector<uint8_t>& x, int t_count, int h, int w, int extra_kind, int prior_kind) {
+  AdaptiveModel9 model(event4_prior(prior_kind));
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(x, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(x, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(decoded, base, y, w, xcoord);
+        uint8_t extra = get_extra8_value(x, decoded, frame_size, base, t, y, h, w, xcoord, extra_kind);
+        int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, extra);
+        uint8_t ev = event_for(cls, prev, left, up);
+        encode_symbol<EVENT_SYMS>(enc, model.event_freq[ctx], ev);
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        if (ev == 3) {
+          encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive9x_prior(const std::vector<uint8_t>& bits, int t_count, int h, int w, int extra_kind, int prior_kind) {
+  AdaptiveModel9 model(event4_prior(prior_kind));
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(out, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(out, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(out, base, y, w, xcoord);
+        uint8_t extra = get_extra8_value(out, out, frame_size, base, t, y, h, w, xcoord, extra_kind);
+        int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, extra);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT_SYMS>(dec, model.event_freq[ctx]));
+        update_adaptive<EVENT_SYMS>(model.event_freq[ctx], ev);
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else {
+          cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<uint8_t> encode_payload_adaptive9e6(const std::vector<uint8_t>& x, int t_count, int h, int w) {
+  AdaptiveModel9E6 model;
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(x, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(x, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(decoded, base, y, w, xcoord);
+        uint8_t left2 = get_left2(decoded, base, xcoord);
+        int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, left2);
+        uint8_t ev = event6_for(cls, prev, left, up, up2, left2);
+        encode_symbol<EVENT6_SYMS>(enc, model.event_freq[ctx], ev);
+        update_adaptive<EVENT6_SYMS>(model.event_freq[ctx], ev);
+        if (ev == 5) {
+          encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive9e6(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  AdaptiveModel9E6 model;
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(out, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(out, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(out, base, y, w, xcoord);
+        uint8_t left2 = get_left2(out, base, xcoord);
+        int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, left2);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT6_SYMS>(dec, model.event_freq[ctx]));
+        update_adaptive<EVENT6_SYMS>(model.event_freq[ctx], ev);
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else if (ev == 3) cls = up2;
+        else if (ev == 4) cls = left2;
+        else {
+          cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<uint8_t> encode_payload_adaptive9e5(const std::vector<uint8_t>& x, int t_count, int h, int w, int event_extra_kind) {
+  AdaptiveModel9E5 model;
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(x, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(x, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(decoded, base, y, w, xcoord);
+        uint8_t left2 = get_left2(decoded, base, xcoord);
+        uint8_t extra = get_extra8_value(x, decoded, frame_size, base, t, y, h, w, xcoord, event_extra_kind);
+        int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, left2);
+        uint8_t ev = event5_for(cls, prev, left, up, extra);
+        encode_symbol<EVENT5_SYMS>(enc, model.event_freq[ctx], ev);
+        update_adaptive<EVENT5_SYMS>(model.event_freq[ctx], ev);
+        if (ev == 4) {
+          encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive9e5(const std::vector<uint8_t>& bits, int t_count, int h, int w, int event_extra_kind) {
+  AdaptiveModel9E5 model;
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(out, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(out, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(out, base, y, w, xcoord);
+        uint8_t left2 = get_left2(out, base, xcoord);
+        uint8_t extra = get_extra8_value(out, out, frame_size, base, t, y, h, w, xcoord, event_extra_kind);
+        int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, left2);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT5_SYMS>(dec, model.event_freq[ctx]));
+        update_adaptive<EVENT5_SYMS>(model.event_freq[ctx], ev);
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else if (ev == 3) cls = extra;
+        else {
+          cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+          update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<uint8_t> encode_payload_adaptive9mix7(const std::vector<uint8_t>& x, int t_count, int h, int w, int low_shift) {
+  AdaptiveModel9 high_model;
+  AdaptiveModel7 low_model;
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(x, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(x, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(decoded, base, y, w, xcoord);
+        uint8_t left2 = get_left2(decoded, base, xcoord);
+        int high_ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, left2);
+        int low_ctx = ctx7_id(prev, left, up, ul, ur, pr, pd);
+        uint8_t ev = event_for(cls, prev, left, up);
+        auto event_freq = mix_freq<EVENT_SYMS>(high_model.event_freq[high_ctx], low_model.event_freq[low_ctx], low_shift);
+        encode_symbol<EVENT_SYMS>(enc, event_freq, ev);
+        update_adaptive<EVENT_SYMS>(high_model.event_freq[high_ctx], ev);
+        update_adaptive<EVENT_SYMS>(low_model.event_freq[low_ctx], ev);
+        if (ev == 3) {
+          auto class_freq = mix_freq<CLASS_SYMS>(high_model.class_freq[high_ctx], low_model.class_freq[low_ctx], low_shift);
+          encode_symbol<CLASS_SYMS>(enc, class_freq, cls);
+          update_adaptive<CLASS_SYMS>(high_model.class_freq[high_ctx], cls);
+          update_adaptive<CLASS_SYMS>(low_model.class_freq[low_ctx], cls);
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive9mix7(const std::vector<uint8_t>& bits, int t_count, int h, int w, int low_shift) {
+  AdaptiveModel9 high_model;
+  AdaptiveModel7 low_model;
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(out, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(out, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(out, base, y, w, xcoord);
+        uint8_t left2 = get_left2(out, base, xcoord);
+        int high_ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, left2);
+        int low_ctx = ctx7_id(prev, left, up, ul, ur, pr, pd);
+        auto event_freq = mix_freq<EVENT_SYMS>(high_model.event_freq[high_ctx], low_model.event_freq[low_ctx], low_shift);
+        uint8_t ev = static_cast<uint8_t>(decode_symbol<EVENT_SYMS>(dec, event_freq));
+        update_adaptive<EVENT_SYMS>(high_model.event_freq[high_ctx], ev);
+        update_adaptive<EVENT_SYMS>(low_model.event_freq[low_ctx], ev);
+        uint8_t cls = 0;
+        if (ev == 0) cls = prev;
+        else if (ev == 1) cls = left;
+        else if (ev == 2) cls = up;
+        else {
+          auto class_freq = mix_freq<CLASS_SYMS>(high_model.class_freq[high_ctx], low_model.class_freq[low_ctx], low_shift);
+          cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, class_freq));
+          update_adaptive<CLASS_SYMS>(high_model.class_freq[high_ctx], cls);
+          update_adaptive<CLASS_SYMS>(low_model.class_freq[low_ctx], cls);
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
+void append_u32(std::vector<uint8_t>& out, uint32_t v) {
+  for (int i = 0; i < 4; i++) out.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+}
+
+void append_u16(std::vector<uint8_t>& out, uint16_t v) {
+  out.push_back(static_cast<uint8_t>(v & 0xFF));
+  out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+}
+
+std::vector<uint8_t> serialize(const std::vector<uint8_t>& bits, int t_count, int h, int w, const Model& model) {
+  std::vector<uint8_t> out;
+  out.insert(out.end(), {'Q', 'M', 'R', '1'});
+  append_u32(out, static_cast<uint32_t>(t_count));
+  append_u32(out, static_cast<uint32_t>(h));
+  append_u32(out, static_cast<uint32_t>(w));
+  for (int ctx = 0; ctx < CTX_COUNT; ctx++) {
+    for (auto v : model.event_freq[ctx]) append_u16(out, v);
+    for (auto v : model.class_freq[ctx]) append_u16(out, v);
+  }
+  append_u32(out, static_cast<uint32_t>(bits.size()));
+  out.insert(out.end(), bits.begin(), bits.end());
+  return out;
+}
+
+std::vector<uint8_t> serialize_adaptive(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  std::vector<uint8_t> out;
+  out.insert(out.end(), {'Q', 'M', 'A', '5'});
+  append_u32(out, static_cast<uint32_t>(t_count));
+  append_u32(out, static_cast<uint32_t>(h));
+  append_u32(out, static_cast<uint32_t>(w));
+  append_u32(out, static_cast<uint32_t>(bits.size()));
+  out.insert(out.end(), bits.begin(), bits.end());
+  return out;
+}
+
+std::vector<uint8_t> serialize_adaptive6(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  std::vector<uint8_t> out;
+  out.insert(out.end(), {'Q', 'M', 'A', '6'});
+  append_u32(out, static_cast<uint32_t>(t_count));
+  append_u32(out, static_cast<uint32_t>(h));
+  append_u32(out, static_cast<uint32_t>(w));
+  append_u32(out, static_cast<uint32_t>(bits.size()));
+  out.insert(out.end(), bits.begin(), bits.end());
+  return out;
+}
+
+std::vector<uint8_t> serialize_adaptive7(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  std::vector<uint8_t> out;
+  out.insert(out.end(), {'Q', 'M', 'A', '7'});
+  append_u32(out, static_cast<uint32_t>(t_count));
+  append_u32(out, static_cast<uint32_t>(h));
+  append_u32(out, static_cast<uint32_t>(w));
+  append_u32(out, static_cast<uint32_t>(bits.size()));
+  out.insert(out.end(), bits.begin(), bits.end());
+  return out;
+}
+
+std::vector<uint8_t> serialize_adaptive8(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  std::vector<uint8_t> out;
+  out.insert(out.end(), {'Q', 'M', 'A', '8'});
+  append_u32(out, static_cast<uint32_t>(t_count));
+  append_u32(out, static_cast<uint32_t>(h));
+  append_u32(out, static_cast<uint32_t>(w));
+  append_u32(out, static_cast<uint32_t>(bits.size()));
+  out.insert(out.end(), bits.begin(), bits.end());
+  return out;
+}
+
+std::vector<uint8_t> serialize_adaptive9(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  std::vector<uint8_t> out;
+  out.insert(out.end(), {'Q', 'M', 'A', '9'});
+  append_u32(out, static_cast<uint32_t>(t_count));
+  append_u32(out, static_cast<uint32_t>(h));
+  append_u32(out, static_cast<uint32_t>(w));
+  append_u32(out, static_cast<uint32_t>(bits.size()));
+  out.insert(out.end(), bits.begin(), bits.end());
+  return out;
+}
+
+std::vector<uint8_t> serialize_adaptive9e6(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  std::vector<uint8_t> out;
+  out.insert(out.end(), {'Q', 'M', 'B', '9'});
+  append_u32(out, static_cast<uint32_t>(t_count));
+  append_u32(out, static_cast<uint32_t>(h));
+  append_u32(out, static_cast<uint32_t>(w));
+  append_u32(out, static_cast<uint32_t>(bits.size()));
+  out.insert(out.end(), bits.begin(), bits.end());
+  return out;
+}
+
+std::vector<uint8_t> serialize_adaptive9e5(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  std::vector<uint8_t> out;
+  out.insert(out.end(), {'Q', 'M', 'C', '9'});
+  append_u32(out, static_cast<uint32_t>(t_count));
+  append_u32(out, static_cast<uint32_t>(h));
+  append_u32(out, static_cast<uint32_t>(w));
+  append_u32(out, static_cast<uint32_t>(bits.size()));
+  out.insert(out.end(), bits.begin(), bits.end());
+  return out;
+}
+
+uint32_t read_u32(const std::vector<uint8_t>& data, size_t& off) {
+  if (off + 4 > data.size()) throw std::runtime_error("truncated u32");
+  uint32_t v = static_cast<uint32_t>(data[off]) | (static_cast<uint32_t>(data[off + 1]) << 8) | (static_cast<uint32_t>(data[off + 2]) << 16) | (static_cast<uint32_t>(data[off + 3]) << 24);
+  off += 4;
+  return v;
+}
+
+std::vector<uint8_t> decode_packed_adaptive6(const std::vector<uint8_t>& packed) {
+  if (packed.size() < 20 || packed[0] != 'Q' || packed[1] != 'M' || packed[2] != 'A' || packed[3] != '6') {
+    throw std::runtime_error("not a QMA6 range-mask payload");
+  }
+  size_t off = 4;
+  int t_count = static_cast<int>(read_u32(packed, off));
+  int h = static_cast<int>(read_u32(packed, off));
+  int w = static_cast<int>(read_u32(packed, off));
+  uint32_t bit_bytes = read_u32(packed, off);
+  if (off + bit_bytes > packed.size()) throw std::runtime_error("truncated bitstream");
+  std::vector<uint8_t> bits(packed.begin() + static_cast<std::ptrdiff_t>(off), packed.begin() + static_cast<std::ptrdiff_t>(off + bit_bytes));
+  return decode_payload_adaptive6pr(bits, t_count, h, w);
+}
+
+std::vector<uint8_t> decode_packed_adaptive7(const std::vector<uint8_t>& packed) {
+  if (packed.size() < 20 || packed[0] != 'Q' || packed[1] != 'M' || packed[2] != 'A' || packed[3] != '7') {
+    throw std::runtime_error("not a QMA7 range-mask payload");
+  }
+  size_t off = 4;
+  int t_count = static_cast<int>(read_u32(packed, off));
+  int h = static_cast<int>(read_u32(packed, off));
+  int w = static_cast<int>(read_u32(packed, off));
+  uint32_t bit_bytes = read_u32(packed, off);
+  if (off + bit_bytes > packed.size()) throw std::runtime_error("truncated bitstream");
+  std::vector<uint8_t> bits(packed.begin() + static_cast<std::ptrdiff_t>(off), packed.begin() + static_cast<std::ptrdiff_t>(off + bit_bytes));
+  return decode_payload_adaptive7prpd(bits, t_count, h, w);
+}
+
+std::vector<uint8_t> decode_packed_adaptive8(const std::vector<uint8_t>& packed) {
+  if (packed.size() < 20 || packed[0] != 'Q' || packed[1] != 'M' || packed[2] != 'A' || packed[3] != '8') {
+    throw std::runtime_error("not a QMA8 range-mask payload");
+  }
+  size_t off = 4;
+  int t_count = static_cast<int>(read_u32(packed, off));
+  int h = static_cast<int>(read_u32(packed, off));
+  int w = static_cast<int>(read_u32(packed, off));
+  uint32_t bit_bytes = read_u32(packed, off);
+  if (off + bit_bytes > packed.size()) throw std::runtime_error("truncated bitstream");
+  std::vector<uint8_t> bits(packed.begin() + static_cast<std::ptrdiff_t>(off), packed.begin() + static_cast<std::ptrdiff_t>(off + bit_bytes));
+  // QMA8 submission payloads use the best audit variant:
+  // prev/left/up/up-left/up-right/prev-right/prev-down/current-up2.
+  return decode_payload_adaptive8x(bits, t_count, h, w, 3);
+}
+
+std::vector<uint8_t> decode_packed_adaptive9(const std::vector<uint8_t>& packed) {
+  if (packed.size() < 20 || packed[0] != 'Q' || packed[1] != 'M' || (packed[2] != 'A' && packed[2] != 'B') || packed[3] != '9') {
+    throw std::runtime_error("not a QMA9 range-mask payload");
+  }
+  size_t off = 4;
+  int t_count = static_cast<int>(read_u32(packed, off));
+  int h = static_cast<int>(read_u32(packed, off));
+  int w = static_cast<int>(read_u32(packed, off));
+  uint32_t bit_bytes = read_u32(packed, off);
+  if (off + bit_bytes > packed.size()) throw std::runtime_error("truncated bitstream");
+  std::vector<uint8_t> bits(packed.begin() + static_cast<std::ptrdiff_t>(off), packed.begin() + static_cast<std::ptrdiff_t>(off + bit_bytes));
+  if (packed[2] == 'B') return decode_payload_adaptive9e6(bits, t_count, h, w);
+  // Best audited QMA9 variant: QMA8 up2 context plus current left2.
+  return decode_payload_adaptive9x(bits, t_count, h, w, 2);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc == 4 && std::string(argv[1]) == "decode") {
+    try {
+      std::vector<uint8_t> packed = read_file(argv[2]);
+      std::vector<uint8_t> decoded;
+      if (packed.size() >= 4 && packed[3] == '9') decoded = decode_packed_adaptive9(packed);
+      else if (packed.size() >= 4 && packed[3] == '8') decoded = decode_packed_adaptive8(packed);
+      else if (packed.size() >= 4 && packed[3] == '7') decoded = decode_packed_adaptive7(packed);
+      else decoded = decode_packed_adaptive6(packed);
+      write_file(argv[3], decoded);
+      std::cout << "{\"decoded_bytes\":" << decoded.size() << "}" << std::endl;
+      return 0;
+    } catch (const std::exception& e) {
+      std::cerr << e.what() << "\\n";
+      return 7;
+    }
+  }
+  if (argc != 6 && argc != 7) {
+    std::cerr << "usage: exact_mask_range_codec <raw_u8> <T> <H> <W> <out.bin> [static3|adaptive5|adaptive6pr|adaptive7prpd|adaptive8prpdpl|adaptive8prpdpu|adaptive8prpdleft2|adaptive8prpdup2|adaptive8prpdpdl|adaptive8prpdpdr|adaptive9up2left2|adaptive9up2pu|adaptive9up2pl|adaptive9up2pdl|adaptive9up2pdr|adaptive9prior1..6|adaptive9e6|adaptive9e5up2|adaptive9e5left2|adaptive9e5pr|adaptive9e5pd|adaptive9mix7s2..5]\\n"
+              << "   or: exact_mask_range_codec decode <in.bin> <out.raw>\\n";
+    return 2;
+  }
+  std::string input_path = argv[1];
+  int t_count = std::stoi(argv[2]);
+  int h = std::stoi(argv[3]);
+  int w = std::stoi(argv[4]);
+  std::string out_path = argv[5];
+  std::string mode = argc == 7 ? argv[6] : "static3";
+  std::vector<uint8_t> x = read_file(input_path);
+  size_t expected = static_cast<size_t>(t_count) * h * w;
+  if (x.size() != expected) {
+    std::cerr << "input size mismatch: got " << x.size() << " expected " << expected << "\\n";
+    return 3;
+  }
+  for (uint8_t v : x) {
+    if (v > 4) {
+      std::cerr << "class value out of range\\n";
+      return 4;
+    }
+  }
+  std::vector<uint8_t> bits;
+  std::vector<uint8_t> decoded;
+  std::vector<uint8_t> packed;
+  if (mode == "static3") {
+    Model model = build_model(x, t_count, h, w);
+    bits = encode_payload(x, t_count, h, w, model);
+    decoded = decode_payload(bits, t_count, h, w, model);
+    packed = serialize(bits, t_count, h, w, model);
+  } else if (mode == "adaptive5") {
+    bits = encode_payload_adaptive5(x, t_count, h, w);
+    decoded = decode_payload_adaptive5(bits, t_count, h, w);
+    packed = serialize_adaptive(bits, t_count, h, w);
+  } else if (mode == "adaptive6pr") {
+    bits = encode_payload_adaptive6pr(x, t_count, h, w);
+    decoded = decode_payload_adaptive6pr(bits, t_count, h, w);
+    packed = serialize_adaptive6(bits, t_count, h, w);
+  } else if (mode == "adaptive7prpd") {
+    bits = encode_payload_adaptive7prpd(x, t_count, h, w);
+    decoded = decode_payload_adaptive7prpd(bits, t_count, h, w);
+    packed = serialize_adaptive7(bits, t_count, h, w);
+  } else if (mode == "adaptive8prpdpl") {
+    bits = encode_payload_adaptive8prpdpl(x, t_count, h, w);
+    decoded = decode_payload_adaptive8prpdpl(bits, t_count, h, w);
+    packed = serialize_adaptive8(bits, t_count, h, w);
+  } else if (mode == "adaptive8prpdpu") {
+    bits = encode_payload_adaptive8x(x, t_count, h, w, 1);
+    decoded = decode_payload_adaptive8x(bits, t_count, h, w, 1);
+    packed = serialize_adaptive8(bits, t_count, h, w);
+  } else if (mode == "adaptive8prpdleft2") {
+    bits = encode_payload_adaptive8x(x, t_count, h, w, 2);
+    decoded = decode_payload_adaptive8x(bits, t_count, h, w, 2);
+    packed = serialize_adaptive8(bits, t_count, h, w);
+  } else if (mode == "adaptive8prpdup2") {
+    bits = encode_payload_adaptive8x(x, t_count, h, w, 3);
+    decoded = decode_payload_adaptive8x(bits, t_count, h, w, 3);
+    packed = serialize_adaptive8(bits, t_count, h, w);
+  } else if (mode == "adaptive8prpdpdl") {
+    bits = encode_payload_adaptive8x(x, t_count, h, w, 4);
+    decoded = decode_payload_adaptive8x(bits, t_count, h, w, 4);
+    packed = serialize_adaptive8(bits, t_count, h, w);
+  } else if (mode == "adaptive8prpdpdr") {
+    bits = encode_payload_adaptive8x(x, t_count, h, w, 5);
+    decoded = decode_payload_adaptive8x(bits, t_count, h, w, 5);
+    packed = serialize_adaptive8(bits, t_count, h, w);
+  } else if (mode == "adaptive9up2left2") {
+    bits = encode_payload_adaptive9x(x, t_count, h, w, 2);
+    decoded = decode_payload_adaptive9x(bits, t_count, h, w, 2);
+    packed = serialize_adaptive9(bits, t_count, h, w);
+  } else if (mode == "adaptive9up2pu") {
+    bits = encode_payload_adaptive9x(x, t_count, h, w, 1);
+    decoded = decode_payload_adaptive9x(bits, t_count, h, w, 1);
+    packed = serialize_adaptive9(bits, t_count, h, w);
+  } else if (mode == "adaptive9up2pl") {
+    bits = encode_payload_adaptive9x(x, t_count, h, w, 0);
+    decoded = decode_payload_adaptive9x(bits, t_count, h, w, 0);
+    packed = serialize_adaptive9(bits, t_count, h, w);
+  } else if (mode == "adaptive9up2pdl") {
+    bits = encode_payload_adaptive9x(x, t_count, h, w, 4);
+    decoded = decode_payload_adaptive9x(bits, t_count, h, w, 4);
+    packed = serialize_adaptive9(bits, t_count, h, w);
+  } else if (mode == "adaptive9up2pdr") {
+    bits = encode_payload_adaptive9x(x, t_count, h, w, 5);
+    decoded = decode_payload_adaptive9x(bits, t_count, h, w, 5);
+    packed = serialize_adaptive9(bits, t_count, h, w);
+  } else if (mode.rfind("adaptive9prior", 0) == 0) {
+    int prior_kind = std::stoi(mode.substr(std::string("adaptive9prior").size()));
+    bits = encode_payload_adaptive9x_prior(x, t_count, h, w, 2, prior_kind);
+    decoded = decode_payload_adaptive9x_prior(bits, t_count, h, w, 2, prior_kind);
+    packed = serialize_adaptive9(bits, t_count, h, w);
+  } else if (mode == "adaptive9e6") {
+    bits = encode_payload_adaptive9e6(x, t_count, h, w);
+    decoded = decode_payload_adaptive9e6(bits, t_count, h, w);
+    packed = serialize_adaptive9e6(bits, t_count, h, w);
+  } else if (mode == "adaptive9e5up2") {
+    bits = encode_payload_adaptive9e5(x, t_count, h, w, 3);
+    decoded = decode_payload_adaptive9e5(bits, t_count, h, w, 3);
+    packed = serialize_adaptive9e5(bits, t_count, h, w);
+  } else if (mode == "adaptive9e5left2") {
+    bits = encode_payload_adaptive9e5(x, t_count, h, w, 2);
+    decoded = decode_payload_adaptive9e5(bits, t_count, h, w, 2);
+    packed = serialize_adaptive9e5(bits, t_count, h, w);
+  } else if (mode == "adaptive9e5pr") {
+    bits = encode_payload_adaptive9e5(x, t_count, h, w, 0);
+    decoded = decode_payload_adaptive9e5(bits, t_count, h, w, 0);
+    packed = serialize_adaptive9e5(bits, t_count, h, w);
+  } else if (mode == "adaptive9e5pd") {
+    bits = encode_payload_adaptive9e5(x, t_count, h, w, 5);
+    decoded = decode_payload_adaptive9e5(bits, t_count, h, w, 5);
+    packed = serialize_adaptive9e5(bits, t_count, h, w);
+  } else if (mode.rfind("adaptive9mix7s", 0) == 0) {
+    int low_shift = std::stoi(mode.substr(std::string("adaptive9mix7s").size()));
+    bits = encode_payload_adaptive9mix7(x, t_count, h, w, low_shift);
+    decoded = decode_payload_adaptive9mix7(bits, t_count, h, w, low_shift);
+    packed = serialize_adaptive9(bits, t_count, h, w);
+  } else {
+    std::cerr << "unknown mode: " << mode << "\\n";
+    return 6;
+  }
+  if (decoded != x) {
+    std::cerr << "decode verification failed\\n";
+    return 5;
+  }
+  write_file(out_path, packed);
+  std::cout << "{"
+            << "\"mode\":\"" << mode << "\","
+            << "\"raw_bytes\":" << x.size() << ","
+            << "\"bitstream_bytes\":" << bits.size() << ","
+            << "\"packed_bytes\":" << packed.size() << ","
+            << "\"model_bytes\":" << (packed.size() - bits.size())
+            << "}" << std::endl;
+  return 0;
+}
