@@ -28,7 +28,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-RANGE_MASK_BR_BYTES = 188214
+RANGE_MASK_BR_BYTES = 182074
+RANGE_MASK_LEGACY_BR_BYTES = 188214
 RANGE_MODEL_BYTES = 56093
 SPLIT_MODEL_PACKED_BR_BYTES = 37176
 SPLIT_MODEL_SCALES_BR_BYTES = 3058
@@ -744,6 +745,12 @@ def load_range_mask(mask_payload: bytes) -> torch.Tensor:
     codec_src = Path(__file__).with_name("range_mask_codec.cpp")
     if not codec_src.exists():
         raise RuntimeError(f"missing range-mask decoder source: {codec_src}")
+    packed_mask = brotli.decompress(mask_payload)
+    if len(packed_mask) < 20:
+        raise RuntimeError("truncated range-mask payload")
+    t_count = int.from_bytes(packed_mask[4:8], "little")
+    mask_h = int.from_bytes(packed_mask[8:12], "little")
+    mask_w = int.from_bytes(packed_mask[12:16], "little")
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         exe = td_path / "range_mask_codec"
@@ -762,9 +769,15 @@ def load_range_mask(mask_payload: bytes) -> torch.Tensor:
             raise RuntimeError("failed to compile range-mask decoder with c++/g++/clang++") from last_error
         packed = td_path / "mask.range"
         raw = td_path / "mask.raw"
-        packed.write_bytes(brotli.decompress(mask_payload))
+        packed.write_bytes(packed_mask)
         subprocess.run([str(exe), "decode", str(packed), str(raw)], check=True)
-        arr = np.frombuffer(raw.read_bytes(), dtype=np.uint8).reshape(600, 384, 512).copy()
+        decoded = np.frombuffer(raw.read_bytes(), dtype=np.uint8)
+        if (t_count, mask_h, mask_w) == (600, 512, 384):
+            arr = decoded.reshape(600, 512, 384).transpose(0, 2, 1).copy()
+        elif (t_count, mask_h, mask_w) == (600, 384, 512):
+            arr = decoded.reshape(600, 384, 512).copy()
+        else:
+            raise RuntimeError(f"unexpected range-mask dimensions: {(t_count, mask_h, mask_w)}")
     return torch.from_numpy(arr).contiguous()
 
 def get_qzs3_split_specs(block_size: int = 32):
@@ -912,21 +925,34 @@ def main():
     color_lut_br = data_dir / "color_lut.npy.br"
     actuator_br = data_dir / "actuator.npz.br"
     smooth_pose_br = data_dir / "smooth_pose.npz.br"
+    is_reordered_split_model_payload = False
+    is_split_range_model_payload = False
+    is_range_mask_payload = False
 
     if packed_payload.exists():
         payload = packed_payload.read_bytes()
-        is_reordered_split_model_payload = len(payload) == RANGE_MASK_BR_BYTES + SPLIT_MODEL_REORDERED_BYTES + 899
-        is_split_range_model_payload = len(payload) == RANGE_MASK_BR_BYTES + SPLIT_MODEL_BYTES + 899
-        is_range_mask_payload = is_reordered_split_model_payload or is_split_range_model_payload or len(payload) == RANGE_MASK_BR_BYTES + RANGE_MODEL_BYTES + 899
+        if len(payload) == RANGE_MASK_BR_BYTES + SPLIT_MODEL_REORDERED_BYTES + 899:
+            mask_br_len = RANGE_MASK_BR_BYTES
+            model_br_len = SPLIT_MODEL_REORDERED_BYTES
+            is_reordered_split_model_payload = True
+            is_range_mask_payload = True
+        elif len(payload) == RANGE_MASK_LEGACY_BR_BYTES + SPLIT_MODEL_REORDERED_BYTES + 899:
+            mask_br_len = RANGE_MASK_LEGACY_BR_BYTES
+            model_br_len = SPLIT_MODEL_REORDERED_BYTES
+            is_reordered_split_model_payload = True
+            is_range_mask_payload = True
+        elif len(payload) == RANGE_MASK_LEGACY_BR_BYTES + SPLIT_MODEL_BYTES + 899:
+            mask_br_len = RANGE_MASK_LEGACY_BR_BYTES
+            model_br_len = SPLIT_MODEL_BYTES
+            is_split_range_model_payload = True
+            is_range_mask_payload = True
+        elif len(payload) == RANGE_MASK_LEGACY_BR_BYTES + RANGE_MODEL_BYTES + 899:
+            mask_br_len = RANGE_MASK_LEGACY_BR_BYTES
+            model_br_len = RANGE_MODEL_BYTES
+            is_range_mask_payload = True
         if is_range_mask_payload:
-            mask_br_data = payload[:RANGE_MASK_BR_BYTES]
-            if is_reordered_split_model_payload:
-                model_br_len = SPLIT_MODEL_REORDERED_BYTES
-            elif is_split_range_model_payload:
-                model_br_len = SPLIT_MODEL_BYTES
-            else:
-                model_br_len = RANGE_MODEL_BYTES
-            model_offset = RANGE_MASK_BR_BYTES
+            mask_br_data = payload[:mask_br_len]
+            model_offset = mask_br_len
         else:
             mask_br_data = payload[:QPOSE_MASK_BYTES]
             model_offset = QPOSE_MASK_BYTES

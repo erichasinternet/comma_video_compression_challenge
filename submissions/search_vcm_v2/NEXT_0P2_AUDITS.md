@@ -428,6 +428,7 @@ adaptive6pr range + Brotli:      204,527 B
 adaptive7prpd range + Brotli:    197,027 B
 adaptive8prpdup2 range+Brotli:   189,654 B
 adaptive9up2left2 range+Brotli:  188,214 B
+adaptive9 on transposed frames:   182,074 B
 ```
 
 The winning context is:
@@ -441,18 +442,20 @@ adaptive context:
 Candidate byte split:
 
 ```text
-mask:     188,214 B
+mask:     182,074 B
 model:     55,725 B
 pose:         899 B
 zip ovh:      100 B
-archive:  244,938 B
-sha256:   5f72a723815703498c65f1d56a41082e9b68a3f0411adc6586d8c4edff524f59
+archive:  238,798 B
+sha256:   649bb787d1ab640e4e963eb41c009b1488b4a7685eae2b19a84465ffc9b8705d
 ```
 
-The model saving is exact-output too: the `QZS3` model payload is split into
-`packed`, `scales`, and `tail` streams before Brotli, with reversible chunk
-reordering inside each stream. `inflate.py` reconstructs the original model
-byte-for-byte before the unchanged PR #67 loader consumes it.
+The final mask saving comes from coding the exact class tensor as transposed
+`512x384` frames, then transposing back after range decode. The model saving is
+exact-output too: the `QZS3` model payload is split into `packed`, `scales`, and
+`tail` streams before Brotli, with reversible chunk reordering inside each
+stream. `inflate.py` reconstructs the original model byte-for-byte before the
+unchanged PR #67 loader consumes it.
 
 Validation:
 
@@ -472,16 +475,16 @@ Public PR #67 projected score:
 reported SegNet:  0.00061000
 reported PoseNet: 0.00048597
 quality:          0.13071155
-archive:          244,938 B
-rate term:        0.16309416
-projected score:  0.29380571
+archive:          238,798 B
+rate term:        0.15900579
+projected score:  0.28971733
 ```
 
 Local notes:
 
 ```text
 uv-run evaluate.sh path succeeds locally on MPS:
-  archive: 245,306 B before model split; final exact-output archive is 244,938 B
+  archive: 245,306 B before model split; final exact-output archive is 238,798 B
   PoseNet: 0.00063294
   SegNet:  0.00072216
   score:   0.32 (local evaluator drift, not output mismatch)
