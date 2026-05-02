@@ -442,12 +442,16 @@ Candidate byte split:
 
 ```text
 mask:     188,214 B
-model:     56,093 B
+model:     55,954 B
 pose:         899 B
 zip ovh:      100 B
-archive:  245,306 B
-sha256:   115aee70f14c0e97661388bc3b2e7ca10c237c1a3277566576ef312add50ec61
+archive:  245,167 B
+sha256:   b7e13f815672fd82e64efb29d9c03fed333df021a47c917e4f3541333470680d
 ```
+
+The model saving is exact-output too: the `QZS3` model payload is split into
+`packed`, `scales`, and `tail` streams before Brotli, then reconstructed
+byte-for-byte by `inflate.py` before the unchanged PR #67 loader consumes it.
 
 Validation:
 
@@ -467,16 +471,16 @@ Public PR #67 projected score:
 reported SegNet:  0.00061000
 reported PoseNet: 0.00048597
 quality:          0.13071155
-archive:          245,306 B
-rate term:        0.16333920
-projected score:  0.29405074
+archive:          245,167 B
+rate term:        0.16324664
+projected score:  0.29395819
 ```
 
 Local notes:
 
 ```text
 uv-run evaluate.sh path succeeds locally on MPS:
-  archive: 245,306 B
+  archive: 245,306 B before model split; final exact-output archive is 245,167 B
   PoseNet: 0.00063294
   SegNet:  0.00072216
   score:   0.32 (local evaluator drift, not output mismatch)

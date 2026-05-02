@@ -30,6 +30,10 @@ from tqdm import tqdm
 
 RANGE_MASK_BR_BYTES = 188214
 RANGE_MODEL_BYTES = 56093
+SPLIT_MODEL_PACKED_BR_BYTES = 37176
+SPLIT_MODEL_SCALES_BR_BYTES = 3058
+SPLIT_MODEL_TAIL_BR_BYTES = 15720
+SPLIT_MODEL_BYTES = SPLIT_MODEL_PACKED_BR_BYTES + SPLIT_MODEL_SCALES_BR_BYTES + SPLIT_MODEL_TAIL_BR_BYTES
 QPOSE_MASK_BYTES = 219472
 
 
@@ -755,6 +759,23 @@ def load_range_mask(mask_payload: bytes) -> torch.Tensor:
         arr = np.frombuffer(raw.read_bytes(), dtype=np.uint8).reshape(600, 384, 512).copy()
     return torch.from_numpy(arr).contiguous()
 
+def load_split_model_payload(model_payload: bytes) -> bytes:
+    if len(model_payload) != SPLIT_MODEL_BYTES:
+        raise RuntimeError(f"unexpected split model payload length: {len(model_payload)}")
+    offset = 0
+    packed_br = model_payload[offset : offset + SPLIT_MODEL_PACKED_BR_BYTES]
+    offset += SPLIT_MODEL_PACKED_BR_BYTES
+    scales_br = model_payload[offset : offset + SPLIT_MODEL_SCALES_BR_BYTES]
+    offset += SPLIT_MODEL_SCALES_BR_BYTES
+    tail_br = model_payload[offset : offset + SPLIT_MODEL_TAIL_BR_BYTES]
+    return (
+        b"QZS3"
+        + (32).to_bytes(2, "little")
+        + brotli.decompress(packed_br)
+        + brotli.decompress(scales_br)
+        + brotli.decompress(tail_br)
+    )
+
 def main():
     if len(sys.argv) < 4:
         print("Usage: python inflate.py <data_dir> <output_dir> <file_list_txt>")
@@ -779,10 +800,11 @@ def main():
 
     if packed_payload.exists():
         payload = packed_payload.read_bytes()
-        is_range_mask_payload = len(payload) == RANGE_MASK_BR_BYTES + RANGE_MODEL_BYTES + 899
+        is_split_range_model_payload = len(payload) == RANGE_MASK_BR_BYTES + SPLIT_MODEL_BYTES + 899
+        is_range_mask_payload = is_split_range_model_payload or len(payload) == RANGE_MASK_BR_BYTES + RANGE_MODEL_BYTES + 899
         if is_range_mask_payload:
             mask_br_data = payload[:RANGE_MASK_BR_BYTES]
-            model_br_len = RANGE_MODEL_BYTES
+            model_br_len = SPLIT_MODEL_BYTES if is_split_range_model_payload else RANGE_MODEL_BYTES
             model_offset = RANGE_MASK_BR_BYTES
         else:
             mask_br_data = payload[:QPOSE_MASK_BYTES]
@@ -813,13 +835,13 @@ def main():
     generator = JointFrameGenerator().to(device)
 
     # 1. Load Weights
-    weights_data = brotli.decompress(model_br_data)
+    weights_data = load_split_model_payload(model_br_data) if packed_payload.exists() and is_split_range_model_payload else brotli.decompress(model_br_data)
     
     generator.load_state_dict(get_decoded_state_dict(weights_data, device), strict=True)
     generator.eval()
 
     # 2. Load Mask Video (.obu) or exact range-coded class tensor.
-    if packed_payload.exists() and len(payload) == RANGE_MASK_BR_BYTES + RANGE_MODEL_BYTES + 899:
+    if packed_payload.exists() and is_range_mask_payload:
         mask_frames_all = load_range_mask(mask_br_data)
     else:
         with tempfile.NamedTemporaryFile(suffix=".obu", delete=False) as tmp_obu:
