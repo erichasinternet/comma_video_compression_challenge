@@ -489,7 +489,7 @@ uv-run evaluate.sh path succeeds locally on MPS:
   archive: 245,306 B before model split; final exact-output archive is 221,490 B
   PoseNet: 0.00063294
   SegNet:  0.00072216
-  score:   0.32 (local evaluator drift, not output mismatch)
+  score:   0.29925 (computed from unrounded local terms)
 
 Local MPS/CPU evaluator remains pessimistic versus public CUDA, as seen with
 q55/qpose/qzs3 earlier. Modal CUDA evaluation reached the evaluator but DALI

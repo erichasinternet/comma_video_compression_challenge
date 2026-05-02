@@ -9,4 +9,13 @@ FILE_LIST="$3"
 
 mkdir -p "$OUTPUT_DIR"
 
-python "$HERE/inflate.py" "$DATA_DIR" "$OUTPUT_DIR" "$FILE_LIST"
+if command -v python >/dev/null 2>&1; then
+  PYTHON_BIN=python
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+else
+  echo "python or python3 is required" >&2
+  exit 127
+fi
+
+"$PYTHON_BIN" "$HERE/inflate.py" "$DATA_DIR" "$OUTPUT_DIR" "$FILE_LIST"
