@@ -33,6 +33,14 @@ RANGE_MODEL_BYTES = 56093
 SPLIT_MODEL_PACKED_BR_BYTES = 37176
 SPLIT_MODEL_SCALES_BR_BYTES = 3058
 SPLIT_MODEL_TAIL_BR_BYTES = 15720
+SPLIT_MODEL_PACKED_REORDERED_BR_BYTES = 37086
+SPLIT_MODEL_SCALES_REORDERED_BR_BYTES = 3035
+SPLIT_MODEL_TAIL_REORDERED_BR_BYTES = 15604
+SPLIT_MODEL_REORDERED_BYTES = (
+    SPLIT_MODEL_PACKED_REORDERED_BR_BYTES
+    + SPLIT_MODEL_SCALES_REORDERED_BR_BYTES
+    + SPLIT_MODEL_TAIL_REORDERED_BR_BYTES
+)
 SPLIT_MODEL_BYTES = SPLIT_MODEL_PACKED_BR_BYTES + SPLIT_MODEL_SCALES_BR_BYTES + SPLIT_MODEL_TAIL_BR_BYTES
 QPOSE_MASK_BYTES = 219472
 
@@ -759,6 +767,113 @@ def load_range_mask(mask_payload: bytes) -> torch.Tensor:
         arr = np.frombuffer(raw.read_bytes(), dtype=np.uint8).reshape(600, 384, 512).copy()
     return torch.from_numpy(arr).contiguous()
 
+def get_qzs3_split_specs(block_size: int = 32):
+    template = JointFrameGenerator()
+    qv_specs = get_qv_specs()
+    packed_chunks = []
+    scales_chunks = []
+    tail_chunks = {
+        "bias": [],
+        "dense_fp": [],
+        "fp_weight": [],
+        "dense_other": [],
+        "qv": [],
+    }
+    covered_keys = set()
+
+    for name, module in template.named_modules():
+        if not isinstance(module, (QConv2d, QEmbedding)):
+            continue
+        covered_keys.add(f"{name}.weight")
+        if getattr(module, "quantize_weight", False):
+            weight_numel = int(module.weight.numel())
+            scale_count = (weight_numel + block_size - 1) // block_size
+            packed_count = (scale_count * block_size + 1) // 2
+            packed_chunks.append((name, packed_count))
+            scales_chunks.append((name, scale_count * 2))
+        else:
+            tail_chunks["fp_weight"].append((f"{name}.weight", int(module.weight.numel()) * 2))
+        if isinstance(module, QConv2d) and module.bias is not None:
+            covered_keys.add(f"{name}.bias")
+            tail_chunks["bias"].append((f"{name}.bias", int(module.bias.numel()) * 2))
+
+    for key, tensor in template.state_dict().items():
+        if key in covered_keys:
+            continue
+        shape = tuple(tensor.shape)
+        count = int(tensor.numel())
+        if key in qv_specs:
+            bits, per_row = qv_specs[key]
+            rows = shape[0] if per_row and len(shape) >= 2 else 1
+            tail_chunks["qv"].append((key, rows * 4 + (count * bits + 7) // 8))
+        elif torch.is_floating_point(tensor):
+            tail_chunks["dense_fp"].append((key, count * 2))
+        else:
+            tail_chunks["dense_other"].append((key, count * tensor.element_size()))
+
+    return packed_chunks, scales_chunks, tail_chunks
+
+def split_chunks(data: bytes, chunks):
+    offset = 0
+    out = {}
+    for name, count in chunks:
+        out[name] = data[offset : offset + count]
+        offset += count
+    if offset != len(data):
+        raise RuntimeError(f"split chunk length mismatch: consumed {offset}, got {len(data)}")
+    return out
+
+def restore_chunk_order(data: bytes, raw_chunks, stored_chunks) -> bytes:
+    pieces = split_chunks(data, stored_chunks)
+    return b"".join(pieces[name] for name, _ in raw_chunks)
+
+def load_reordered_split_model_payload(model_payload: bytes) -> bytes:
+    if len(model_payload) != SPLIT_MODEL_REORDERED_BYTES:
+        raise RuntimeError(f"unexpected reordered split model payload length: {len(model_payload)}")
+
+    offset = 0
+    packed_br = model_payload[offset : offset + SPLIT_MODEL_PACKED_REORDERED_BR_BYTES]
+    offset += SPLIT_MODEL_PACKED_REORDERED_BR_BYTES
+    scales_br = model_payload[offset : offset + SPLIT_MODEL_SCALES_REORDERED_BR_BYTES]
+    offset += SPLIT_MODEL_SCALES_REORDERED_BR_BYTES
+    tail_br = model_payload[offset : offset + SPLIT_MODEL_TAIL_REORDERED_BR_BYTES]
+
+    packed_chunks, scales_chunks, tail_chunks = get_qzs3_split_specs()
+
+    packed = restore_chunk_order(
+        brotli.decompress(packed_br),
+        packed_chunks,
+        sorted(packed_chunks, key=lambda item: (item[1], item[0])),
+    )
+    scales = restore_chunk_order(
+        brotli.decompress(scales_br),
+        scales_chunks,
+        sorted(scales_chunks, key=lambda item: (-item[1], item[0])),
+    )
+
+    tail_raw_order = ("bias", "dense_fp", "fp_weight", "dense_other", "qv")
+    tail_stored_order = ("qv", "dense_fp", "fp_weight", "bias")
+    tail_stored_chunks = {
+        "qv": sorted(tail_chunks["qv"], key=lambda item: item[0], reverse=True),
+        "dense_fp": sorted(tail_chunks["dense_fp"], key=lambda item: (item[1], item[0])),
+        "fp_weight": list(reversed(tail_chunks["fp_weight"])),
+        "bias": sorted(tail_chunks["bias"], key=lambda item: (-item[1], item[0])),
+    }
+    tail_data = brotli.decompress(tail_br)
+    tail_offset = 0
+    tail_by_type = {}
+    for key in tail_stored_order:
+        byte_count = sum(size for _, size in tail_stored_chunks[key])
+        type_data = tail_data[tail_offset : tail_offset + byte_count]
+        tail_offset += byte_count
+        tail_by_type[key] = restore_chunk_order(type_data, tail_chunks[key], tail_stored_chunks[key])
+    if tail_offset != len(tail_data):
+        raise RuntimeError(f"tail length mismatch: consumed {tail_offset}, got {len(tail_data)}")
+    tail_by_type["dense_other"] = b""
+    tail = b"".join(tail_by_type[key] for key in tail_raw_order)
+
+    return b"QZS3" + (32).to_bytes(2, "little") + packed + scales + tail
+
 def load_split_model_payload(model_payload: bytes) -> bytes:
     if len(model_payload) != SPLIT_MODEL_BYTES:
         raise RuntimeError(f"unexpected split model payload length: {len(model_payload)}")
@@ -800,11 +915,17 @@ def main():
 
     if packed_payload.exists():
         payload = packed_payload.read_bytes()
+        is_reordered_split_model_payload = len(payload) == RANGE_MASK_BR_BYTES + SPLIT_MODEL_REORDERED_BYTES + 899
         is_split_range_model_payload = len(payload) == RANGE_MASK_BR_BYTES + SPLIT_MODEL_BYTES + 899
-        is_range_mask_payload = is_split_range_model_payload or len(payload) == RANGE_MASK_BR_BYTES + RANGE_MODEL_BYTES + 899
+        is_range_mask_payload = is_reordered_split_model_payload or is_split_range_model_payload or len(payload) == RANGE_MASK_BR_BYTES + RANGE_MODEL_BYTES + 899
         if is_range_mask_payload:
             mask_br_data = payload[:RANGE_MASK_BR_BYTES]
-            model_br_len = SPLIT_MODEL_BYTES if is_split_range_model_payload else RANGE_MODEL_BYTES
+            if is_reordered_split_model_payload:
+                model_br_len = SPLIT_MODEL_REORDERED_BYTES
+            elif is_split_range_model_payload:
+                model_br_len = SPLIT_MODEL_BYTES
+            else:
+                model_br_len = RANGE_MODEL_BYTES
             model_offset = RANGE_MASK_BR_BYTES
         else:
             mask_br_data = payload[:QPOSE_MASK_BYTES]
@@ -835,7 +956,12 @@ def main():
     generator = JointFrameGenerator().to(device)
 
     # 1. Load Weights
-    weights_data = load_split_model_payload(model_br_data) if packed_payload.exists() and is_split_range_model_payload else brotli.decompress(model_br_data)
+    if packed_payload.exists() and is_reordered_split_model_payload:
+        weights_data = load_reordered_split_model_payload(model_br_data)
+    elif packed_payload.exists() and is_split_range_model_payload:
+        weights_data = load_split_model_payload(model_br_data)
+    else:
+        weights_data = brotli.decompress(model_br_data)
     
     generator.load_state_dict(get_decoded_state_dict(weights_data, device), strict=True)
     generator.eval()
