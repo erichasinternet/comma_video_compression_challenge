@@ -28,8 +28,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-RANGE_MASK_BR_BYTES = 182074
-RANGE_MASK_LEGACY_BR_BYTES = 188214
+RANGE_MASK_BR_BYTES = 164766
 RANGE_MODEL_BYTES = 56093
 SPLIT_MODEL_PACKED_BR_BYTES = 37176
 SPLIT_MODEL_SCALES_BR_BYTES = 3058
@@ -935,20 +934,6 @@ def main():
             mask_br_len = RANGE_MASK_BR_BYTES
             model_br_len = SPLIT_MODEL_REORDERED_BYTES
             is_reordered_split_model_payload = True
-            is_range_mask_payload = True
-        elif len(payload) == RANGE_MASK_LEGACY_BR_BYTES + SPLIT_MODEL_REORDERED_BYTES + 899:
-            mask_br_len = RANGE_MASK_LEGACY_BR_BYTES
-            model_br_len = SPLIT_MODEL_REORDERED_BYTES
-            is_reordered_split_model_payload = True
-            is_range_mask_payload = True
-        elif len(payload) == RANGE_MASK_LEGACY_BR_BYTES + SPLIT_MODEL_BYTES + 899:
-            mask_br_len = RANGE_MASK_LEGACY_BR_BYTES
-            model_br_len = SPLIT_MODEL_BYTES
-            is_split_range_model_payload = True
-            is_range_mask_payload = True
-        elif len(payload) == RANGE_MASK_LEGACY_BR_BYTES + RANGE_MODEL_BYTES + 899:
-            mask_br_len = RANGE_MASK_LEGACY_BR_BYTES
-            model_br_len = RANGE_MODEL_BYTES
             is_range_mask_payload = True
         if is_range_mask_payload:
             mask_br_data = payload[:mask_br_len]

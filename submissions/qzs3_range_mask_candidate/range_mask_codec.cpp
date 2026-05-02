@@ -27,7 +27,7 @@ constexpr uint32_t TOP = 0xFFFFFFFFu;
 constexpr uint32_t HALF = 0x80000000u;
 constexpr uint32_t FIRST_QTR = 0x40000000u;
 constexpr uint32_t THIRD_QTR = 0xC0000000u;
-constexpr uint32_t SCALE_TOTAL = 4096;
+constexpr uint32_t SCALE_TOTAL = 65535;
 
 struct Model {
   std::array<std::array<uint16_t, EVENT_SYMS>, CTX_COUNT> event_freq{};
