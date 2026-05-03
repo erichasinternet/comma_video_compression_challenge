@@ -412,7 +412,8 @@ void update_adaptive(std::array<uint16_t, N>& freq, uint32_t sym) {
     }
   }
   (void)total;
-  if (freq[sym] < 65535) freq[sym]++;
+  freq[sym] = static_cast<uint16_t>(
+      std::min<uint32_t>(65535, static_cast<uint32_t>(freq[sym]) + 24));
 }
 
 template <size_t N>

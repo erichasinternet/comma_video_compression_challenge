@@ -430,6 +430,7 @@ adaptive8prpdup2 range+Brotli:   189,654 B
 adaptive9up2left2 range+Brotli:  188,214 B
 adaptive9 on transposed frames:   182,074 B
 transposed + scale_total=65535:  164,766 B
+scale_total=65535, update+=24:  161,024 B
 ```
 
 The winning context is:
@@ -443,21 +444,21 @@ adaptive context:
 Candidate byte split:
 
 ```text
-mask:     164,766 B
+mask:     161,024 B
 model:     55,725 B
 pose:         899 B
 zip ovh:      100 B
-archive:  221,490 B
-sha256:   db3048e3aaf0ab14f3e9a3e7b14ef65c637ee3694092f26d0a8eba0b3f16e0bc
+archive:  217,748 B
+sha256:   1bd30bd7dc72481859f12233a9cfee5064b6706702106140d905ed010e45d8ca
 ```
 
 The final mask saving comes from coding the exact class tensor as transposed
 `512x384` frames with a slower-forgetting adaptive model (`SCALE_TOTAL=65535`),
-then transposing back after range decode. The model saving is exact-output too:
-the `QZS3` model payload is split into `packed`, `scales`, and `tail` streams
-before Brotli, with reversible chunk reordering inside each stream. `inflate.py`
-reconstructs the original model byte-for-byte before the unchanged PR #67 loader
-consumes it.
+an update increment of `24`, then transposing back after range decode. The model
+saving is exact-output too: the `QZS3` model payload is split into `packed`,
+`scales`, and `tail` streams before Brotli, with reversible chunk reordering
+inside each stream. `inflate.py` reconstructs the original model byte-for-byte
+before the unchanged PR #67 loader consumes it.
 
 Validation:
 
@@ -477,16 +478,16 @@ Public PR #67 projected score:
 reported SegNet:  0.00061000
 reported PoseNet: 0.00048597
 quality:          0.13071155
-archive:          221,490 B
-rate term:        0.14748110
-projected score:  0.27819265
+archive:          217,748 B
+rate term:        0.14498946
+projected score:  0.27570100
 ```
 
 Local notes:
 
 ```text
 uv-run evaluate.sh path succeeds locally on MPS:
-  archive: 245,306 B before model split; final exact-output archive is 221,490 B
+  archive: 245,306 B before model split; final exact-output archive is 217,748 B
   PoseNet: 0.00063294
   SegNet:  0.00072216
   score:   0.29925 (computed from unrounded local terms)
