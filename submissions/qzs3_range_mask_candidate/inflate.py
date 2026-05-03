@@ -43,6 +43,9 @@ SPLIT_MODEL_REORDERED_BYTES = (
 )
 SPLIT_MODEL_BYTES = SPLIT_MODEL_PACKED_BR_BYTES + SPLIT_MODEL_SCALES_BR_BYTES + SPLIT_MODEL_TAIL_BR_BYTES
 QPOSE_MASK_BYTES = 219472
+ROUTER_ACTION_BYTES = 225
+ROUTER_ACTION_COUNT = 600
+ROUTER_ACTION_BITS = 3
 
 
 # -----------------------------
@@ -903,6 +906,56 @@ def load_split_model_payload(model_payload: bytes) -> bytes:
         + brotli.decompress(tail_br)
     )
 
+def unpack_router_actions(action_payload: bytes, count: int = ROUTER_ACTION_COUNT) -> torch.Tensor:
+    if len(action_payload) != ROUTER_ACTION_BYTES:
+        raise RuntimeError(f"unexpected router action payload length: {len(action_payload)}")
+    vals = []
+    acc = 0
+    bits = 0
+    for byte in action_payload:
+        acc |= int(byte) << bits
+        bits += 8
+        while bits >= ROUTER_ACTION_BITS and len(vals) < count:
+            vals.append(acc & ((1 << ROUTER_ACTION_BITS) - 1))
+            acc >>= ROUTER_ACTION_BITS
+            bits -= ROUTER_ACTION_BITS
+    if len(vals) != count:
+        raise RuntimeError(f"decoded {len(vals)} router actions, expected {count}")
+    return torch.tensor(vals, dtype=torch.uint8)
+
+def apply_router_actions(batch_comp: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    if actions.numel() == 0:
+        return batch_comp
+    out = batch_comp.clamp(0, 255).round()
+    actions = actions.to(device=out.device, dtype=torch.long)
+
+    def select(action_id: int) -> torch.Tensor:
+        return actions == action_id
+
+    # Action 0: identity.
+    mask = select(1)
+    if mask.any():  # f2_bias_b_-3
+        out[mask, 1, 2:3] = (out[mask, 1, 2:3] - 3.0).clamp(0, 255).round()
+    mask = select(2)
+    if mask.any():  # both_bias_g_-3
+        out[mask, :, 1:2] = (out[mask, :, 1:2] - 3.0).clamp(0, 255).round()
+    mask = select(3)
+    if mask.any():  # both_bias_all_-2
+        out[mask] = (out[mask] - 2.0).clamp(0, 255).round()
+    mask = select(4)
+    if mask.any():  # f2_scale_all_1.03
+        out[mask, 1:2] = ((out[mask, 1:2] - 128.0) * 1.03 + 128.0).clamp(0, 255).round()
+    mask = select(5)
+    if mask.any():  # f2_bias_r_+3
+        out[mask, 1, 0:1] = (out[mask, 1, 0:1] + 3.0).clamp(0, 255).round()
+    mask = select(6)
+    if mask.any():  # f2_bias_g_-4
+        out[mask, 1, 1:2] = (out[mask, 1, 1:2] - 4.0).clamp(0, 255).round()
+    mask = select(7)
+    if mask.any():  # both_gamma_all_1.04
+        out[mask] = torch.pow((out[mask] / 255.0).clamp(0.0, 1.0), 1.04).mul(255.0).clamp(0, 255).round()
+    return out
+
 def main():
     if len(sys.argv) < 4:
         print("Usage: python inflate.py <data_dir> <output_dir> <file_list_txt>")
@@ -927,10 +980,12 @@ def main():
     is_reordered_split_model_payload = False
     is_split_range_model_payload = False
     is_range_mask_payload = False
+    router_actions_data = None
 
     if packed_payload.exists():
         payload = packed_payload.read_bytes()
-        if len(payload) == RANGE_MASK_BYTES + SPLIT_MODEL_REORDERED_BYTES + 899:
+        base_range_payload_len = RANGE_MASK_BYTES + SPLIT_MODEL_REORDERED_BYTES + 899
+        if len(payload) in (base_range_payload_len, base_range_payload_len + ROUTER_ACTION_BYTES):
             mask_br_len = RANGE_MASK_BYTES
             model_br_len = SPLIT_MODEL_REORDERED_BYTES
             is_reordered_split_model_payload = True
@@ -958,7 +1013,12 @@ def main():
         else:
             model_br_len = 61147
         model_br_data = payload[model_offset:model_offset + model_br_len]
-        pose_q_br_data = payload[model_offset + model_br_len:]
+        pose_start = model_offset + model_br_len
+        if is_range_mask_payload:
+            pose_q_br_data = payload[pose_start : pose_start + 899]
+            router_actions_data = payload[pose_start + 899 :] or None
+        else:
+            pose_q_br_data = payload[pose_start:]
     else:
         mask_br_data = mask_br.read_bytes()
         model_br_data = model_br.read_bytes()
@@ -1027,6 +1087,7 @@ def main():
         else:
             pose_np = pose_payload
     pose_frames_all = torch.from_numpy(pose_np).float()
+    router_actions_all = unpack_router_actions(router_actions_data) if router_actions_data is not None else None
     smooth_pose = load_smooth_pose(smooth_pose_br)
     if smooth_pose is not None:
         basis = make_smooth_pose_basis(pose_np.shape[0], smooth_pose["basis_kind"])
@@ -1092,6 +1153,9 @@ def main():
                     fake2_up = F.interpolate(fake2, size=(out_h, out_w), mode="bilinear", align_corners=False)
 
                     batch_comp = torch.stack([fake1_up, fake2_up], dim=1)
+                    if router_actions_all is not None:
+                        actions = router_actions_all[file_pair_start + i : file_pair_start + i + batch_comp.shape[0]]
+                        batch_comp = apply_router_actions(batch_comp, actions)
                     batch_comp = einops.rearrange(batch_comp, "b t c h w -> (b t) h w c")
 
                     output_bytes = batch_comp.clamp(0, 255).round().to(torch.uint8)
