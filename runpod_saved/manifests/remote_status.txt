@@ -1,0 +1,38 @@
+# remote git
+codex/quantizr-latent-sweep
+6d2dceeb4143c80ef809ab37da0d31941e1cee85
+ M models/posenet.safetensors
+ M models/segnet.safetensors
+ M submissions/damir_bearclaw_003/images/pose0_occlusion_rank_04_pair_0252.png
+ M submissions/damir_bearclaw_003/images/segnet_classes_frame_0171_mask.png
+ M submissions/quantizr/compress.py
+ M submissions/quantizr/inflate.py
+ M videos/0.mkv
+?? run_logs/
+?? submissions/quantizr/eval_generated_video_transcode.py
+?? submissions/quantizr/eval_mask_codec_oracle.py
+?? submissions/quantizr/evaluator_renderer.py
+?? submissions/quantizr/experiments/
+?? submissions/quantizr/mask_tree_codec.py
+?? submissions/quantizr/pack_model.py
+?? submissions/quantizr/run_autodecoder_probe.sh
+?? submissions/quantizr/run_q20_masktree_gate.sh
+?? submissions/quantizr/watch_proxy_gate.py
+# remote gpu
+pid, process_name, used_gpu_memory [MiB]
+# key result files
+submissions/quantizr/experiments/autodecoder_D0_64_001/probe_results.jsonl
+submissions/quantizr/experiments/autodecoder_smoke_001/probe_results.jsonl
+submissions/quantizr/experiments/generated_transcode_oracle_svt_002/generated_video_transcode_results.jsonl
+submissions/quantizr/experiments/generated_transcode_oracle_target_001/generated_video_transcode_results.jsonl
+submissions/quantizr/experiments/gpt_pose_gate/crf50_c156_c264_h52_cond48_z0_repro/archive/final_metrics.json
+submissions/quantizr/experiments/mask_oracle/mask_substitution_results.jsonl
+submissions/quantizr/experiments/mask_oracle_best_cuda/mask_substitution_results.jsonl
+submissions/quantizr/experiments/mask_oracle_cuda/mask_substitution_results.jsonl
+submissions/quantizr/experiments/masktree_v1/oracle_bytes_001/mask_codec_oracle_results.jsonl
+submissions/quantizr/experiments/masktree_v1/oracle_bytes_002/mask_codec_oracle_results.jsonl
+submissions/quantizr/experiments/masktree_v1/oracle_cuda_001/mask_codec_oracle_results.jsonl
+submissions/quantizr/experiments/masktree_v1/oracle_cuda_002/mask_codec_oracle_results.jsonl
+submissions/quantizr/experiments/shortlist_a5000_001/crf50_c148_c256_h48_cond40_z0/archive/final_metrics.json
+submissions/quantizr/experiments/shortlist_a5000_001/crf50_c148_c256_h48_cond40_z8/archive/final_metrics.json
+submissions/quantizr/experiments/shortlist_a5000_001/crf54_c148_c256_h48_cond40_z0/archive/final_metrics.json

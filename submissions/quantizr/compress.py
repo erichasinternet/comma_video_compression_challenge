@@ -486,37 +486,75 @@ class QEmbedding(nn.Embedding, QMixin):
 # Architecture
 # -----------------------------
 class SepConvGNAct(nn.Module):
-    def __init__(self, in_ch, out_ch, k=3, stride=1, depth_mult=4, quantize_weight=True):
+    def __init__(
+        self,
+        in_ch,
+        out_ch,
+        k=3,
+        stride=1,
+        depth_mult=4,
+        quantize_weight=True,
+        padding_mode="zeros",
+    ):
         super().__init__()
         mid_ch = in_ch * depth_mult
-        self.dw = QConv2d(in_ch, mid_ch, k, stride=stride, padding=k//2, groups=in_ch, bias=False, quantize_weight=quantize_weight)
+        self.dw = QConv2d(
+            in_ch,
+            mid_ch,
+            k,
+            stride=stride,
+            padding=k // 2,
+            groups=in_ch,
+            bias=False,
+            padding_mode=padding_mode,
+            quantize_weight=quantize_weight,
+        )
         self.pw = QConv2d(mid_ch, out_ch, 1, padding=0, bias=True, quantize_weight=quantize_weight)
         self.norm = nn.GroupNorm(2, out_ch)
         self.act = nn.SiLU(inplace=True)
     def forward(self, x): return self.act(self.norm(self.pw(self.dw(x))))
 
 class SepConv(nn.Module):
-    def __init__(self, in_ch, out_ch, k=3, stride=1, depth_mult=4, quantize_weight=True):
+    def __init__(
+        self,
+        in_ch,
+        out_ch,
+        k=3,
+        stride=1,
+        depth_mult=4,
+        quantize_weight=True,
+        padding_mode="zeros",
+    ):
         super().__init__()
         mid_ch = in_ch * depth_mult
-        self.dw = QConv2d(in_ch, mid_ch, k, stride=stride, padding=k//2, groups=in_ch, bias=False, quantize_weight=quantize_weight)
+        self.dw = QConv2d(
+            in_ch,
+            mid_ch,
+            k,
+            stride=stride,
+            padding=k // 2,
+            groups=in_ch,
+            bias=False,
+            padding_mode=padding_mode,
+            quantize_weight=quantize_weight,
+        )
         self.pw = QConv2d(mid_ch, out_ch, 1, padding=0, bias=True, quantize_weight=quantize_weight)
     def forward(self, x): return self.pw(self.dw(x))
 
 class SepResBlock(nn.Module):
-    def __init__(self, ch, depth_mult=4, quantize_weight=True):
+    def __init__(self, ch, depth_mult=4, quantize_weight=True, padding_mode="zeros"):
         super().__init__()
-        self.conv1 = SepConvGNAct(ch, ch, 3, 1, depth_mult=depth_mult, quantize_weight=quantize_weight)
-        self.conv2 = SepConv(ch, ch, 3, 1, depth_mult=depth_mult, quantize_weight=quantize_weight)
+        self.conv1 = SepConvGNAct(ch, ch, 3, 1, depth_mult=depth_mult, quantize_weight=quantize_weight, padding_mode=padding_mode)
+        self.conv2 = SepConv(ch, ch, 3, 1, depth_mult=depth_mult, quantize_weight=quantize_weight, padding_mode=padding_mode)
         self.norm2 = nn.GroupNorm(2, ch)
         self.act = nn.SiLU(inplace=True)
     def forward(self, x): return self.act(x + self.norm2(self.conv2(self.conv1(x))))
 
 class FiLMSepResBlock(nn.Module):
-    def __init__(self, ch, cond_dim, depth_mult=4, quantize_weight=True):
+    def __init__(self, ch, cond_dim, depth_mult=4, quantize_weight=True, padding_mode="zeros"):
         super().__init__()
-        self.conv1 = SepConvGNAct(ch, ch, 3, 1, depth_mult=depth_mult, quantize_weight=quantize_weight)
-        self.conv2 = SepConv(ch, ch, 3, 1, depth_mult=depth_mult, quantize_weight=quantize_weight)
+        self.conv1 = SepConvGNAct(ch, ch, 3, 1, depth_mult=depth_mult, quantize_weight=quantize_weight, padding_mode=padding_mode)
+        self.conv2 = SepConv(ch, ch, 3, 1, depth_mult=depth_mult, quantize_weight=quantize_weight, padding_mode=padding_mode)
         self.norm2 = nn.GroupNorm(2, ch)
         self.film_proj = nn.Linear(cond_dim, ch * 2)
         self.act = nn.SiLU(inplace=True)
@@ -526,16 +564,19 @@ class FiLMSepResBlock(nn.Module):
         return self.act(x + (x_base * (1.0 + gamma) + beta))
 
 class SharedMaskDecoder(nn.Module):
-    def __init__(self, num_classes=5, emb_dim=6, c1=56, c2=64, depth_mult=1):
+    def __init__(self, num_classes=5, emb_dim=6, c1=56, c2=64, depth_mult=1, padding_mode="zeros"):
         super().__init__()
         self.embedding = QEmbedding(num_classes, emb_dim, quantize_weight=False)
-        self.stem_conv = SepConvGNAct(emb_dim + 2, c1, depth_mult=depth_mult)
-        self.stem_block = SepResBlock(c1, depth_mult=depth_mult)
-        self.down_conv = SepConvGNAct(c1, c2, stride=2, depth_mult=depth_mult)
-        self.down_block = SepResBlock(c2, depth_mult=depth_mult)
-        self.up = nn.Sequential(nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False), SepConvGNAct(c2, c1, depth_mult=depth_mult))
-        self.fuse = SepConvGNAct(c1 + c1, c1, depth_mult=depth_mult)
-        self.fuse_block = SepResBlock(c1, depth_mult=depth_mult)
+        self.stem_conv = SepConvGNAct(emb_dim + 2, c1, depth_mult=depth_mult, padding_mode=padding_mode)
+        self.stem_block = SepResBlock(c1, depth_mult=depth_mult, padding_mode=padding_mode)
+        self.down_conv = SepConvGNAct(c1, c2, stride=2, depth_mult=depth_mult, padding_mode=padding_mode)
+        self.down_block = SepResBlock(c2, depth_mult=depth_mult, padding_mode=padding_mode)
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            SepConvGNAct(c2, c1, depth_mult=depth_mult, padding_mode=padding_mode),
+        )
+        self.fuse = SepConvGNAct(c1 + c1, c1, depth_mult=depth_mult, padding_mode=padding_mode)
+        self.fuse_block = SepResBlock(c1, depth_mult=depth_mult, padding_mode=padding_mode)
 
     def forward(self, mask2, coords):
         e2 = self.embedding(mask2.long()).permute(0, 3, 1, 2)
@@ -545,30 +586,58 @@ class SharedMaskDecoder(nn.Module):
         return self.fuse_block(self.fuse(torch.cat([z, s], dim=1)))
 
 class Frame2StaticHead(nn.Module):
-    def __init__(self, in_ch, hidden=52, depth_mult=1):
+    def __init__(self, in_ch, hidden=52, depth_mult=1, padding_mode="zeros"):
         super().__init__()
-        self.block1 = SepResBlock(in_ch, depth_mult=depth_mult)
-        self.block2 = SepResBlock(in_ch, depth_mult=depth_mult)
-        self.pre = SepConvGNAct(in_ch, hidden, depth_mult=depth_mult)
+        self.block1 = SepResBlock(in_ch, depth_mult=depth_mult, padding_mode=padding_mode)
+        self.block2 = SepResBlock(in_ch, depth_mult=depth_mult, padding_mode=padding_mode)
+        self.pre = SepConvGNAct(in_ch, hidden, depth_mult=depth_mult, padding_mode=padding_mode)
         self.head = QConv2d(hidden, 3, 1, quantize_weight=False)
     def forward(self, feat): return torch.sigmoid(self.head(self.pre(self.block2(self.block1(feat))))) * 255.0
 
 class FrameHead(nn.Module):
-    def __init__(self, in_ch, cond_dim=48, hidden=52, depth_mult=1):
+    def __init__(self, in_ch, cond_dim=48, hidden=52, depth_mult=1, padding_mode="zeros"):
         super().__init__()
-        self.block1 = FiLMSepResBlock(in_ch, cond_dim, depth_mult=depth_mult)
-        self.block2 = SepResBlock(in_ch, depth_mult=depth_mult)
-        self.pre = SepConvGNAct(in_ch, hidden, depth_mult=depth_mult)
+        self.block1 = FiLMSepResBlock(in_ch, cond_dim, depth_mult=depth_mult, padding_mode=padding_mode)
+        self.block2 = SepResBlock(in_ch, depth_mult=depth_mult, padding_mode=padding_mode)
+        self.pre = SepConvGNAct(in_ch, hidden, depth_mult=depth_mult, padding_mode=padding_mode)
         self.head = QConv2d(hidden, 3, 1, quantize_weight=False)
     def forward(self, feat, cond_emb): return torch.sigmoid(self.head(self.pre(self.block2(self.block1(feat, cond_emb))))) * 255.0
 
 class JointFrameGenerator(nn.Module):
-    def __init__(self, num_classes=5, pose_dim=6, cond_dim=48, depth_mult=1):
+    def __init__(
+        self,
+        num_classes=5,
+        pose_dim=6,
+        cond_dim=48,
+        depth_mult=1,
+        shared_c1=56,
+        shared_c2=64,
+        frame_hidden=52,
+        padding_mode="zeros",
+    ):
         super().__init__()
-        self.shared_trunk = SharedMaskDecoder(num_classes=num_classes, emb_dim=6, c1=56, c2=64, depth_mult=depth_mult)
+        self.shared_trunk = SharedMaskDecoder(
+            num_classes=num_classes,
+            emb_dim=6,
+            c1=shared_c1,
+            c2=shared_c2,
+            depth_mult=depth_mult,
+            padding_mode=padding_mode,
+        )
         self.pose_mlp = nn.Sequential(nn.Linear(pose_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
-        self.frame1_head = FrameHead(in_ch=56, cond_dim=cond_dim, hidden=52, depth_mult=depth_mult)
-        self.frame2_head = Frame2StaticHead(in_ch=56, hidden=52, depth_mult=depth_mult)
+        self.frame1_head = FrameHead(
+            in_ch=shared_c1,
+            cond_dim=cond_dim,
+            hidden=frame_hidden,
+            depth_mult=depth_mult,
+            padding_mode=padding_mode,
+        )
+        self.frame2_head = Frame2StaticHead(
+            in_ch=shared_c1,
+            hidden=frame_hidden,
+            depth_mult=depth_mult,
+            padding_mode=padding_mode,
+        )
 
     def set_qat(self, enabled: bool):
         for m in self.modules():

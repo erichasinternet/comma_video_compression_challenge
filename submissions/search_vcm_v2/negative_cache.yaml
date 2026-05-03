@@ -1,0 +1,62 @@
+allowed_v2_families:
+  - qpose14_baseline
+  - qpose14_official_packaging
+  - lowmask_boundary_residual
+
+dead_families:
+  mask_range_av1:
+    reason: "Class-preserving range/mask optimization failed; class flips and residual repair dominated."
+  mask_range_residual:
+    reason: "Exact residual repair was byte-negative; residual stream too large."
+  scanline_contour_codec:
+    reason: "Best scanline exact-mask codec was 270,010 B vs 219,472 B AV1."
+  semantic_contour_codec:
+    reason: "Not pursued after scanline hard fail; no evidence contour path can reach target."
+  exact_mask_motion_codec:
+    reason: "Motion-compensated exact-mask codec failed: best verified payload 340,696 B vs 219,472 B AV1 mask."
+  lowmask_exact_tile_router:
+    reason: "Exact qpose tile injection into PR62 renderer was byte-negative; best hard8 score delta was only -0.00014 at +4,093 B and larger budgets worsened quality."
+  quantizr_mask_recompression:
+    reason: "CRF50 qrecode changed tiny hard-class fraction but destroyed PoseNet."
+  qrecode_recovery:
+    reason: "Full-generator qrecode50 recovery failed early gates."
+  mask_tree:
+    reason: "Hit byte targets but destroyed evaluator quality."
+  scv_cartoon:
+    reason: "Synthetic cartoon domain failed SegNet/PoseNet quality gates."
+  tavs_video:
+    reason: "Optimized conventional video source failed real-codec byte/quality gates."
+  commavq_task_renderer:
+    reason: "Pretrained commaVQ tokens failed PoseNet hard8 renderer oracle."
+  task_token_vcm:
+    reason: "Random task-token capacity failed PoseNet hard8 gate."
+  task_nerv_vcm:
+    reason: "Task-NeRV hard8 failed; PoseNet remained catastrophic."
+  selfcomp_plus:
+    reason: "SegNet improvements were not PoseNet-safe."
+  hard_sample_sidecar:
+    reason: "Perfect replacement needed too many samples; encoded sidecars destroyed quality."
+  quantizr_student_compression:
+    reason: "Exact-mask tiny student failed capacity gate."
+  quantizr_deep_compression:
+    reason: "Quantizr model already mostly FP4-packed; major blocks fragile."
+  posenet_preprocess_oracle:
+    reason: "Original target reachable, but interpolation gate reached only at alpha=1.0."
+  teacher_distilled_inflation:
+    reason: "Teacher Gate 1 failed; T1/T2 best step was 0, T3 PoseNet blew up."
+  factorized_exactmask_pose_tokens:
+    reason: "Gate 1 hard8 capacity failed qpose-relative pass: best hard8 quality 0.87274584 vs qpose14 hard8 0.18193570."
+  lowmask_qpose_distill:
+    reason: "Gate 1 hard8 capacity failed qpose-relative pass: best hard8 quality 0.97094486 vs qpose14 hard8 0.18193570; PoseNet moved but SegNet remained far outside gate."
+  henosis_postprocess_increment:
+    reason: "PR65 extra tiny controls failed CPU verification: best hard8 quality gains were <=0.00052 vs the ~0.020 full-score gap."
+  qzs3_lowbit_model_reduction:
+    reason: "PR67 QZS3 low-bit post-hoc and QAT probes failed: required ~20KB model savings produced hard3/hard8 quality orders of magnitude worse than baseline."
+  qzs3_slim_structural_distillation:
+    reason: "Width-reduced qpose-compatible generators failed hard3 by orders of magnitude; best s44 indexed teacher run reached 2.885 quality vs ~0.225 qpose hard3, and pose-heavy batch training remained >7 quality."
+  qzs3_pose_channel_expansion:
+    reason: "PR67/QP1 and qpose14 pose archives only carry useful col0 pose; adding/switching qpose pose channels did not improve CPU hard8 quality."
+  qzs3_pose_mlp_finetune:
+    reason: "Constrained same-byte pose-MLP fine-tune produced no verified CPU hard8 win; best checkpoint was 0.18031 vs 0.18018 base, while larger updates caused tail blowups."
+  pr62_fp4_generator_finetune:
+    reason: "Starting from PR62's trained low-byte generator, evaluator/qpose fine-tunes produced only tiny hard3 improvements (-0.0023 best) before PoseNet blowups; all-weight qpose pressure was destructive."

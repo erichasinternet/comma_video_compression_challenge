@@ -1,0 +1,17 @@
+=== Evaluation config ===
+  batch_size: 16
+  device: cpu
+  num_threads: 2
+  prefetch_queue_depth: 4
+  report: submissions/qzs3_range_mask_candidate/report_cpu_router.txt
+  seed: 1234
+  submission_dir: submissions/qzs3_range_mask_candidate
+  uncompressed_dir: videos
+  video_names_file: public_test_video_names.txt
+=== Evaluation results over 600 samples ===
+  Average PoseNet Distortion: 0.00052044
+  Average SegNet Distortion: 0.00071877
+  Submission file size: 215,960 bytes
+  Original uncompressed size: 37,545,489 bytes
+  Compression Rate: 0.00575196
+  Final score: 100*segnet_dist + √(10*posenet_dist) + 25*rate = 0.29

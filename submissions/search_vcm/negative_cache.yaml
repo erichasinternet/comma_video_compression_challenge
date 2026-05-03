@@ -1,0 +1,33 @@
+dead_families:
+  - mask_tree
+  - scv_cartoon
+  - commavq_stock_decoder
+  - commavq_task_renderer
+  - task_token_random
+  - task_nerv_vcm
+  - selfcomp_global_train
+  - selfcomp_pose_locked_seg_repair
+  - tavs_conventional_video
+  - hard_sample_original_sidecar
+  - scanline_contour_codec
+  - class_range_mask_av1
+  - posenet_preprocess_oracle
+  - teacher_distilled_inflation
+
+dead_reasons:
+  posenet_preprocess_oracle: "PoseNet target is reachable and preprocessing is correct, but hard8 interpolation reaches the gate only at alpha=1.0, meaning the q55-to-original path requires essentially full original PoseNet-space information. Not a low-byte local control surface."
+  teacher_distilled_inflation: "Original frames pass the target, but offline teacher inversion from q55/regularized continuations cannot find a distillable hard8 target under the required quality gate. The L4/A10 Gate 1 sweep with T1 direct, T2 low+mid residual, and T3 continuation failed: T1/T2 best remained at q55 step 0, while T3 reduced SegNet but catastrophically worsened PoseNet."
+
+dead_configs:
+  q55_pareto_controls:
+    - per_sample_frame2_grid_64
+    - unrestricted_paired_grid_64
+    - class_lut_existing
+  quantizr:
+    - regenerated_crf50_masks
+    - qrecode50_recovery
+    - lowres_mask_96_128_192
+    - exact_residual_mask
+    - mask_cleaning
+    - student_compression
+    - deep_model_compression
