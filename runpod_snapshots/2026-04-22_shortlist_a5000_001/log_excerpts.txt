@@ -1,0 +1,56 @@
+Snapshot time: 2026-04-22 19:12:20 MDT
+
+RunPod state preserved:
+- Active narrowed sweep was stopped intentionally to avoid further GPU spend while handing off to GPT Pro.
+- After stop, no `sweep_official.py`, `compress.py`, or `evaluate.py` processes remained on the pod.
+
+Completed candidate metrics:
+- crf50_c148_c256_h48_cond40_z0
+  {"archive_bytes": 284665.0, "posenet_dist": 0.02823848, "rate": 0.00758187, "score": 0.8233766585423492, "segnet_dist": 0.00102431}
+- crf50_c148_c256_h48_cond40_z8
+  {"archive_bytes": 293145.0, "posenet_dist": 0.02697271, "rate": 0.00780773, "score": 0.8122018277350104, "segnet_dist": 0.00097656}
+- crf54_c148_c256_h48_cond40_z0
+  {"archive_bytes": 249726.0, "posenet_dist": 0.02141283, "rate": 0.00665129, "score": 0.7960072417880449, "segnet_dist": 0.00166985}
+
+Candidate status inventory at stop:
+- crf50_c148_c256_h48_cond40_z0: final_metrics.json present
+- crf50_c148_c256_h48_cond40_z8: final_metrics.json present
+- crf50_c156_c264_h48_cond40_z0: no final_metrics.json; crashed with training CUDA OOM
+- crf54_c148_c256_h48_cond40_z0: final_metrics.json present
+- crf54_c148_c256_h48_cond40_z8: no final_metrics.json; training finished and official CPU eval was in progress when terminated
+
+Important failure excerpt from shortlist_a5000_001_resume.log:
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 60.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 3.25 MiB is free. Including non-PyTorch memory, this process has 23.55 GiB memory in use. Of the allocated memory 23.17 GiB is allocated by PyTorch, and 119.38 MiB is reserved by PyTorch but unallocated.
+
+This OOM happened on:
+- candidate: crf50_c156_c264_h48_cond40_z0
+- stage: run1_anchor
+- model width: c1=56, c2=64
+- batch_size: 4
+
+Final log excerpt from shortlist_a5000_001_narrow.log when terminated:
+=== Evaluation config ===
+  batch_size: 16
+  device: cpu
+  num_threads: 2
+  prefetch_queue_depth: 4
+  report: /tmp/quantizr_eval_lb3ri7e7/report.txt
+  seed: 1234
+  submission_dir: /tmp/quantizr_eval_lb3ri7e7
+  uncompressed_dir: /workspace/comma_video_compression_challenge/videos
+  video_names_file: /workspace/comma_video_compression_challenge/public_test_video_names.txt
+AVVideoDataset on rank 0 with 1 files.
+TensorVideoDataset on rank 0 with 1 files.
+
+1it [00:23, 23.97s/it]
+2it [00:45, 22.24s/it]
+3it [01:07, 22.44s/it]
+4it [01:30, 22.62s/it]
+5it [01:53, 22.77s/it]
+6it [02:15, 22.46s/it]
+7it [02:38, 22.77s/it]
+8it [03:01, 22.66s/it]
+9it [03:23, 22.66s/it]
+10it [03:45, 22.31s/it]
+11it [04:05, 21.48s/it]
+12it [04:24, 20.90s/it]Terminated

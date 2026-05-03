@@ -1,0 +1,3 @@
+{"archive_bytes": 284665.0, "name": "crf50_c148_c256_h48_cond40_z0", "posenet_dist": 0.02823848, "rate": 0.00758187, "score": 0.8233766585423492, "segnet_dist": 0.00102431}
+{"archive_bytes": 293145.0, "name": "crf50_c148_c256_h48_cond40_z8", "posenet_dist": 0.02697271, "rate": 0.00780773, "score": 0.8122018277350104, "segnet_dist": 0.00097656}
+{"archive_bytes": 249726.0, "name": "crf54_c148_c256_h48_cond40_z0", "posenet_dist": 0.02141283, "rate": 0.00665129, "score": 0.7960072417880449, "segnet_dist": 0.00166985}
