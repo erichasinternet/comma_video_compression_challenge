@@ -84,6 +84,21 @@ struct AdaptiveModel9 {
   }
 };
 
+struct AdaptiveModel9Binary {
+  std::vector<std::array<uint16_t, 2>> prev_freq;
+  std::vector<std::array<uint16_t, 2>> left_freq;
+  std::vector<std::array<uint16_t, 2>> up_freq;
+  std::vector<std::array<uint16_t, CLASS_SYMS>> class_freq;
+
+  AdaptiveModel9Binary()
+      : prev_freq(CTX9_COUNT), left_freq(CTX9_COUNT), up_freq(CTX9_COUNT), class_freq(CTX9_COUNT) {
+    for (auto& row : prev_freq) row.fill(1);
+    for (auto& row : left_freq) row.fill(1);
+    for (auto& row : up_freq) row.fill(1);
+    for (auto& row : class_freq) row.fill(1);
+  }
+};
+
 struct BitWriter {
   std::vector<uint8_t> bytes;
   uint8_t cur = 0;
@@ -413,7 +428,7 @@ void update_adaptive(std::array<uint16_t, N>& freq, uint32_t sym) {
   }
   (void)total;
   freq[sym] = static_cast<uint16_t>(
-      std::min<uint32_t>(65535, static_cast<uint32_t>(freq[sym]) + 24));
+      std::min<uint32_t>(65535, static_cast<uint32_t>(freq[sym]) + 20));
 }
 
 template <size_t N>
@@ -898,6 +913,98 @@ std::vector<uint8_t> decode_payload_adaptive9x(const std::vector<uint8_t>& bits,
   return out;
 }
 
+std::vector<uint8_t> encode_payload_adaptive9bin(const std::vector<uint8_t>& x, int t_count, int h, int w) {
+  AdaptiveModel9Binary model;
+  ArithmeticEncoder enc;
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> decoded(x.size(), 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        size_t idx = base + xcoord;
+        uint8_t cls = x[idx];
+        uint8_t prev = get_prev(x, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(decoded, base, xcoord);
+        uint8_t up = get_up(decoded, base, y, w, xcoord);
+        uint8_t ul = get_up_left(decoded, base, y, w, xcoord);
+        uint8_t ur = get_up_right(decoded, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(x, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(x, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(decoded, base, y, w, xcoord);
+        uint8_t left2 = get_left2(decoded, base, xcoord);
+        int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, left2);
+        uint8_t b = cls == prev;
+        encode_symbol<2>(enc, model.prev_freq[ctx], b);
+        update_adaptive<2>(model.prev_freq[ctx], b);
+        if (!b) {
+          b = cls == left;
+          encode_symbol<2>(enc, model.left_freq[ctx], b);
+          update_adaptive<2>(model.left_freq[ctx], b);
+          if (!b) {
+            b = cls == up;
+            encode_symbol<2>(enc, model.up_freq[ctx], b);
+            update_adaptive<2>(model.up_freq[ctx], b);
+            if (!b) {
+              encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
+              update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+            }
+          }
+        }
+        decoded[idx] = cls;
+      }
+    }
+  }
+  return enc.finish();
+}
+
+std::vector<uint8_t> decode_payload_adaptive9bin(const std::vector<uint8_t>& bits, int t_count, int h, int w) {
+  AdaptiveModel9Binary model;
+  ArithmeticDecoder dec(bits);
+  const size_t frame_size = static_cast<size_t>(h) * w;
+  std::vector<uint8_t> out(static_cast<size_t>(t_count) * frame_size, 0);
+  for (int t = 0; t < t_count; t++) {
+    for (int y = 0; y < h; y++) {
+      size_t base = static_cast<size_t>(t) * frame_size + static_cast<size_t>(y) * w;
+      for (int xcoord = 0; xcoord < w; xcoord++) {
+        uint8_t prev = get_prev(out, frame_size, t, y, w, xcoord);
+        uint8_t left = get_left(out, base, xcoord);
+        uint8_t up = get_up(out, base, y, w, xcoord);
+        uint8_t ul = get_up_left(out, base, y, w, xcoord);
+        uint8_t ur = get_up_right(out, base, y, w, xcoord);
+        uint8_t pr = get_prev_right(out, frame_size, t, y, w, xcoord);
+        uint8_t pd = get_prev_down(out, frame_size, t, y, h, w, xcoord);
+        uint8_t up2 = get_up2(out, base, y, w, xcoord);
+        uint8_t left2 = get_left2(out, base, xcoord);
+        int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, left2);
+        uint8_t cls = 0;
+        uint8_t b = static_cast<uint8_t>(decode_symbol<2>(dec, model.prev_freq[ctx]));
+        update_adaptive<2>(model.prev_freq[ctx], b);
+        if (b) {
+          cls = prev;
+        } else {
+          b = static_cast<uint8_t>(decode_symbol<2>(dec, model.left_freq[ctx]));
+          update_adaptive<2>(model.left_freq[ctx], b);
+          if (b) {
+            cls = left;
+          } else {
+            b = static_cast<uint8_t>(decode_symbol<2>(dec, model.up_freq[ctx]));
+            update_adaptive<2>(model.up_freq[ctx], b);
+            if (b) {
+              cls = up;
+            } else {
+              cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
+              update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
+            }
+          }
+        }
+        out[base + xcoord] = cls;
+      }
+    }
+  }
+  return out;
+}
+
 void append_u32(std::vector<uint8_t>& out, uint32_t v) {
   for (int i = 0; i < 4; i++) out.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
 }
@@ -1039,8 +1146,9 @@ std::vector<uint8_t> decode_packed_adaptive9(const std::vector<uint8_t>& packed)
   uint32_t bit_bytes = read_u32(packed, off);
   if (off + bit_bytes > packed.size()) throw std::runtime_error("truncated bitstream");
   std::vector<uint8_t> bits(packed.begin() + static_cast<std::ptrdiff_t>(off), packed.begin() + static_cast<std::ptrdiff_t>(off + bit_bytes));
-  // Best audited QMA9 variant: QMA8 up2 context plus current left2.
-  return decode_payload_adaptive9x(bits, t_count, h, w, 2);
+  // Best audited QMA9 variant: hierarchical prev/left/up binary decisions
+  // with QMA8 up2 plus current left2 context.
+  return decode_payload_adaptive9bin(bits, t_count, h, w);
 }
 
 }  // namespace
