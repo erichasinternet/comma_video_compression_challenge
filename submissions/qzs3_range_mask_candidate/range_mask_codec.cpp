@@ -1,7 +1,8 @@
-// Static arithmetic coder audit for exact qpose/Quantizr masks.
+// Range-mask arithmetic decoder used by qzs3_range_mask_candidate.
 //
-// This is not an inflate-ready submission codec yet. It verifies whether the
-// p6 raster context entropy oracle can be approached by an actual coder.
+// inflate.py compiles this small self-contained helper at runtime and invokes
+// the decode path. Keeping the decoder as source avoids shipping a
+// platform-specific binary while preserving a straightforward inflate flow.
 
 #include <algorithm>
 #include <array>
