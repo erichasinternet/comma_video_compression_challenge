@@ -93,8 +93,8 @@ struct AdaptiveModel9Binary {
   AdaptiveModel9Binary()
       : prev_freq(CTX9_COUNT), left_freq(CTX9_COUNT), up_freq(CTX9_COUNT), class_freq(CTX9_COUNT) {
     for (auto& row : prev_freq) row.fill(1);
-    for (auto& row : left_freq) row.fill(1);
-    for (auto& row : up_freq) row.fill(1);
+    for (auto& row : left_freq) row = {1, 2};
+    for (auto& row : up_freq) row = {1, 4};
     for (auto& row : class_freq) row.fill(1);
   }
 };
@@ -428,7 +428,7 @@ void update_adaptive(std::array<uint16_t, N>& freq, uint32_t sym) {
   }
   (void)total;
   freq[sym] = static_cast<uint16_t>(
-      std::min<uint32_t>(65535, static_cast<uint32_t>(freq[sym]) + 19));
+      std::min<uint32_t>(65535, static_cast<uint32_t>(freq[sym]) + 20));
 }
 
 template <size_t N>
