@@ -29,6 +29,22 @@ constexpr uint32_t FIRST_QTR = 0x40000000u;
 constexpr uint32_t THIRD_QTR = 0xC0000000u;
 constexpr uint32_t SCALE_TOTAL = 65535;
 
+#ifndef UP_TRUE_INIT
+#define UP_TRUE_INIT 3
+#endif
+#ifndef LEFT_TRUE_INIT
+#define LEFT_TRUE_INIT 4
+#endif
+#ifndef PREV_TRUE_INIT
+#define PREV_TRUE_INIT 3
+#endif
+#ifndef IMPOSSIBLE_FALSE_INIT
+#define IMPOSSIBLE_FALSE_INIT 60000
+#endif
+#ifndef FALLBACK_OTHER_INIT
+#define FALLBACK_OTHER_INIT 3
+#endif
+
 struct Model {
   std::array<std::array<uint16_t, EVENT_SYMS>, CTX_COUNT> event_freq{};
   std::array<std::array<uint16_t, CLASS_SYMS>, CTX_COUNT> class_freq{};
@@ -92,10 +108,39 @@ struct AdaptiveModel9Binary {
 
   AdaptiveModel9Binary()
       : prev_freq(CTX9_COUNT), left_freq(CTX9_COUNT), up_freq(CTX9_COUNT), class_freq(CTX9_COUNT) {
-    for (auto& row : prev_freq) row.fill(1);
-    for (auto& row : left_freq) row = {1, 2};
-    for (auto& row : up_freq) row = {1, 4};
-    for (auto& row : class_freq) row.fill(1);
+    for (int ctx = 0; ctx < CTX9_COUNT; ctx++) {
+      int v = ctx;
+      uint8_t left2 = static_cast<uint8_t>(v % 6); v /= 6;
+      uint8_t up2 = static_cast<uint8_t>(v % 6); v /= 6;
+      uint8_t pd = static_cast<uint8_t>(v % 6); v /= 6;
+      uint8_t pr = static_cast<uint8_t>(v % 6); v /= 6;
+      uint8_t ur = static_cast<uint8_t>(v % 6); v /= 6;
+      uint8_t ul = static_cast<uint8_t>(v % 6); v /= 6;
+      uint8_t up = static_cast<uint8_t>(v % 6); v /= 6;
+      uint8_t left = static_cast<uint8_t>(v % 6); v /= 6;
+      uint8_t prev = static_cast<uint8_t>(v % 6);
+      (void)left2;
+      (void)up2;
+      (void)pd;
+      (void)pr;
+      (void)ur;
+      (void)ul;
+
+      prev_freq[ctx] = {1, PREV_TRUE_INIT};
+      left_freq[ctx] = {1, LEFT_TRUE_INIT};
+      up_freq[ctx] = {1, UP_TRUE_INIT};
+      class_freq[ctx].fill(1);
+
+      if (up == SENTINEL) up_freq[ctx] = {IMPOSSIBLE_FALSE_INIT, 1};
+      if (left == SENTINEL || left == up) left_freq[ctx] = {IMPOSSIBLE_FALSE_INIT, 1};
+      if (prev == SENTINEL || prev == up || prev == left) prev_freq[ctx] = {IMPOSSIBLE_FALSE_INIT, 1};
+
+      // The fallback class symbol is only reached after up/left/prev have all
+      // been rejected, so valid predictor classes are unlikely in this branch.
+      for (uint8_t cls = 0; cls < CLASS_SYMS; cls++) {
+        if (cls != up && cls != left && cls != prev) class_freq[ctx][cls] = FALLBACK_OTHER_INIT;
+      }
+    }
   }
 };
 
@@ -1146,7 +1191,7 @@ std::vector<uint8_t> decode_packed_adaptive9(const std::vector<uint8_t>& packed)
   uint32_t bit_bytes = read_u32(packed, off);
   if (off + bit_bytes > packed.size()) throw std::runtime_error("truncated bitstream");
   std::vector<uint8_t> bits(packed.begin() + static_cast<std::ptrdiff_t>(off), packed.begin() + static_cast<std::ptrdiff_t>(off + bit_bytes));
-  // Best audited QMA9 variant: hierarchical prev/left/up binary decisions
+  // Best audited QMA9 variant: hierarchical up/left/prev binary decisions
   // with QMA8 up2 plus current left2 context.
   return decode_payload_adaptive9bin(bits, t_count, h, w);
 }
@@ -1171,7 +1216,7 @@ int main(int argc, char** argv) {
     }
   }
   if (argc != 6 && argc != 7) {
-    std::cerr << "usage: exact_mask_range_codec <raw_u8> <T> <H> <W> <out.bin> [static3|adaptive5|adaptive6pr|adaptive7prpd|adaptive8prpdpl|adaptive8prpdpu|adaptive8prpdleft2|adaptive8prpdup2|adaptive8prpdpdl|adaptive8prpdpdr|adaptive9up2left2|adaptive9up2pu|adaptive9up2pl]\\n"
+    std::cerr << "usage: exact_mask_range_codec <raw_u8> <T> <H> <W> <out.bin> [static3|adaptive5|adaptive6pr|adaptive7prpd|adaptive8prpdpl|adaptive8prpdpu|adaptive8prpdleft2|adaptive8prpdup2|adaptive8prpdpdl|adaptive8prpdpdr|adaptive9up2left2|adaptive9up2pu|adaptive9up2pl|adaptive9bin]\\n"
               << "   or: exact_mask_range_codec decode <in.bin> <out.raw>\\n";
     return 2;
   }
@@ -1248,6 +1293,10 @@ int main(int argc, char** argv) {
   } else if (mode == "adaptive9up2pl") {
     bits = encode_payload_adaptive9x(x, t_count, h, w, 0);
     decoded = decode_payload_adaptive9x(bits, t_count, h, w, 0);
+    packed = serialize_adaptive9(bits, t_count, h, w);
+  } else if (mode == "adaptive9bin") {
+    bits = encode_payload_adaptive9bin(x, t_count, h, w);
+    decoded = decode_payload_adaptive9bin(bits, t_count, h, w);
     packed = serialize_adaptive9(bits, t_count, h, w);
   } else {
     std::cerr << "unknown mode: " << mode << "\\n";

@@ -431,6 +431,11 @@ adaptive9up2left2 range+Brotli:  188,214 B
 adaptive9 on transposed frames:   182,074 B
 transposed + scale_total=65535:  164,766 B
 scale_total=65535, update+=24:  161,024 B
+hierarchical binary events:       160,116 B
+binary order up/left/prev:        159,714 B
+weak binary init priors:          159,523 B
+store raw range stream:           159,518 B
+context-aware binary init sweep:  159,011 B
 ```
 
 The winning context is:
@@ -444,21 +449,29 @@ adaptive context:
 Candidate byte split:
 
 ```text
-mask:     161,024 B
+mask:     159,011 B
 model:     55,725 B
 pose:         899 B
 zip ovh:      100 B
-archive:  217,748 B
-sha256:   1bd30bd7dc72481859f12233a9cfee5064b6706702106140d905ed010e45d8ca
+archive:  215,735 B
+sha256:   fd2258c598c50a71069b7f539ca0cae00aea2bc2a6ba0cbf5d2e6886106cd003
 ```
 
 The final mask saving comes from coding the exact class tensor as transposed
 `512x384` frames with a slower-forgetting adaptive model (`SCALE_TOTAL=65535`),
-an update increment of `24`, then transposing back after range decode. The model
-saving is exact-output too: the `QZS3` model payload is split into `packed`,
-`scales`, and `tail` streams before Brotli, with reversible chunk reordering
-inside each stream. `inflate.py` reconstructs the original model byte-for-byte
-before the unchanged PR #67 loader consumes it.
+then using hierarchical binary decisions in `up -> left -> prev` order with weak
+global priors (`up={1,4}`, `left={1,2}`, `prev={1,1}`). The arithmetic range
+stream is now stored directly because Brotli adds 5 bytes. The model saving is
+exact-output too: the `QZS3` model payload is split into `packed`, `scales`, and
+`tail` streams before Brotli, with reversible chunk reordering inside each
+stream. `inflate.py` reconstructs the original model byte-for-byte before the
+unchanged PR #67 loader consumes it.
+
+The final context-aware binary prior sweep makes the initial probability model
+deterministic from the local context: impossible predictors are strongly biased
+false, and fallback class symbols are biased toward classes not already rejected
+by the `up/left/prev` tests. This saves 507 B over the previous raw QMA9 stream
+without changing any decoded class or generated frame.
 
 Validation:
 
@@ -481,6 +494,52 @@ quality:          0.13071155
 archive:          217,748 B
 rate term:        0.14498946
 projected score:  0.27570100
+```
+
+Current checkpoint:
+
+```text
+archive:          216,242 B
+rate term:        0.14398667
+projected score:  0.27469822
+```
+
+Current checkpoint after the context-aware prior sweep:
+
+```text
+archive:          215,735 B
+rate term:        0.14364908
+projected score:  0.27436063
+```
+
+Stretch `0.250` audit:
+
+```text
+required quality at 215,735 B: 0.10635092
+PR67 quality:                   0.13071155
+quality improvement needed:     0.02436063
+```
+
+The current binary context model's static empirical entropy is:
+
+```text
+entropy_bytes: 156,765
+current mask:  159,011
+gap:             2,246 B
+```
+
+That closes this exact-mask entropy family as a route to `0.250`: even a perfect
+coder for the current context model cannot recover the roughly `37 KB` same-
+quality archive reduction needed for the stretch score. Further progress toward
+`0.250` requires evaluator-quality improvement, not another local entropy tweak.
+
+New public PR audit:
+
+```text
+PR #70 mask_decoder reports score 0.19 at 57,329 B, but inflate.py is 1.3 MB
+and contains large submission-specific mask reconstruction tables outside the
+counted archive. This violates our no-loophole constraint, so it is not used as
+a foundation for this candidate.
 ```
 
 Local notes:
