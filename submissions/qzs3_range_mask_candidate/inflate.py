@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-RANGE_MASK_BR_BYTES = 159523
+RANGE_MASK_BYTES = 159518
 RANGE_MODEL_BYTES = 56093
 SPLIT_MODEL_PACKED_BR_BYTES = 37176
 SPLIT_MODEL_SCALES_BR_BYTES = 3058
@@ -744,7 +744,7 @@ def load_range_mask(mask_payload: bytes) -> torch.Tensor:
     codec_src = Path(__file__).with_name("range_mask_codec.cpp")
     if not codec_src.exists():
         raise RuntimeError(f"missing range-mask decoder source: {codec_src}")
-    packed_mask = brotli.decompress(mask_payload)
+    packed_mask = mask_payload
     if len(packed_mask) < 20:
         raise RuntimeError("truncated range-mask payload")
     t_count = int.from_bytes(packed_mask[4:8], "little")
@@ -930,8 +930,8 @@ def main():
 
     if packed_payload.exists():
         payload = packed_payload.read_bytes()
-        if len(payload) == RANGE_MASK_BR_BYTES + SPLIT_MODEL_REORDERED_BYTES + 899:
-            mask_br_len = RANGE_MASK_BR_BYTES
+        if len(payload) == RANGE_MASK_BYTES + SPLIT_MODEL_REORDERED_BYTES + 899:
+            mask_br_len = RANGE_MASK_BYTES
             model_br_len = SPLIT_MODEL_REORDERED_BYTES
             is_reordered_split_model_payload = True
             is_range_mask_payload = True
