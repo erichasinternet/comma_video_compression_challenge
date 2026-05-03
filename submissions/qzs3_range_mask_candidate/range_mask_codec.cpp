@@ -428,7 +428,7 @@ void update_adaptive(std::array<uint16_t, N>& freq, uint32_t sym) {
   }
   (void)total;
   freq[sym] = static_cast<uint16_t>(
-      std::min<uint32_t>(65535, static_cast<uint32_t>(freq[sym]) + 20));
+      std::min<uint32_t>(65535, static_cast<uint32_t>(freq[sym]) + 19));
 }
 
 template <size_t N>
@@ -934,17 +934,17 @@ std::vector<uint8_t> encode_payload_adaptive9bin(const std::vector<uint8_t>& x, 
         uint8_t up2 = get_up2(decoded, base, y, w, xcoord);
         uint8_t left2 = get_left2(decoded, base, xcoord);
         int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, left2);
-        uint8_t b = cls == prev;
-        encode_symbol<2>(enc, model.prev_freq[ctx], b);
-        update_adaptive<2>(model.prev_freq[ctx], b);
+        uint8_t b = cls == up;
+        encode_symbol<2>(enc, model.up_freq[ctx], b);
+        update_adaptive<2>(model.up_freq[ctx], b);
         if (!b) {
           b = cls == left;
           encode_symbol<2>(enc, model.left_freq[ctx], b);
           update_adaptive<2>(model.left_freq[ctx], b);
           if (!b) {
-            b = cls == up;
-            encode_symbol<2>(enc, model.up_freq[ctx], b);
-            update_adaptive<2>(model.up_freq[ctx], b);
+            b = cls == prev;
+            encode_symbol<2>(enc, model.prev_freq[ctx], b);
+            update_adaptive<2>(model.prev_freq[ctx], b);
             if (!b) {
               encode_symbol<CLASS_SYMS>(enc, model.class_freq[ctx], cls);
               update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
@@ -978,20 +978,20 @@ std::vector<uint8_t> decode_payload_adaptive9bin(const std::vector<uint8_t>& bit
         uint8_t left2 = get_left2(out, base, xcoord);
         int ctx = ctx9_id(prev, left, up, ul, ur, pr, pd, up2, left2);
         uint8_t cls = 0;
-        uint8_t b = static_cast<uint8_t>(decode_symbol<2>(dec, model.prev_freq[ctx]));
-        update_adaptive<2>(model.prev_freq[ctx], b);
+        uint8_t b = static_cast<uint8_t>(decode_symbol<2>(dec, model.up_freq[ctx]));
+        update_adaptive<2>(model.up_freq[ctx], b);
         if (b) {
-          cls = prev;
+          cls = up;
         } else {
           b = static_cast<uint8_t>(decode_symbol<2>(dec, model.left_freq[ctx]));
           update_adaptive<2>(model.left_freq[ctx], b);
           if (b) {
             cls = left;
           } else {
-            b = static_cast<uint8_t>(decode_symbol<2>(dec, model.up_freq[ctx]));
-            update_adaptive<2>(model.up_freq[ctx], b);
+            b = static_cast<uint8_t>(decode_symbol<2>(dec, model.prev_freq[ctx]));
+            update_adaptive<2>(model.prev_freq[ctx], b);
             if (b) {
-              cls = up;
+              cls = prev;
             } else {
               cls = static_cast<uint8_t>(decode_symbol<CLASS_SYMS>(dec, model.class_freq[ctx]));
               update_adaptive<CLASS_SYMS>(model.class_freq[ctx], cls);
